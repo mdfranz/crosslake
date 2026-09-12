@@ -16,3 +16,11 @@ local:
 
 cursor_file: ./cursor.json # tools/poller/cursor.json, gitignored
 poll_interval_seconds: 60
+
+# How many S3 objects to process between flush+cursor-checkpoints. Flushing
+# forces a new Avro OCF compression block, so checkpointing every object (1)
+# was measured to roughly double the Avro file size on a real batch (one
+# ~2.4-record block per object) -- see LEARNINGS.md. Higher values compress
+# better but widen the at-least-once replay window on crash (up to this many
+# objects re-fetched and re-appended next run). Default: 100.
+checkpoint_every_objects: 100

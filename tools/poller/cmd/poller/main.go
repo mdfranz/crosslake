@@ -213,24 +213,34 @@ func runOnce(ctx context.Context, src *s3source.Source, schema avro.Schema, cfg 
 			total++
 		}
 
-		// OCF writes are buffered. Persist both outputs before advancing the
-		// cursor or a crash can acknowledge records that never reached disk.
-		if err := sink.Flush(); err != nil {
-			objSpan.SetStatus(codes.Error, "flush_failed")
-			objSpan.End()
-			return total, err
-		}
-		cur.LastKey = key
-		if err := cursor.Save(cfg.CursorFile, cur); err != nil {
-			objSpan.SetStatus(codes.Error, "checkpoint_failed")
-			objSpan.End()
-			return total, err
-		}
 		objSpan.SetAttributes(
 			attribute.Int("object.records_written", len(blob.Records)),
 			attribute.Int64("object.duration_ms", time.Since(objectStarted).Milliseconds()),
 		)
 		objSpan.End()
+
+		// OCF writes are buffered, and Flush forces a new compression
+		// block. Flushing/checkpointing after every single object was
+		// measured to produce one ~2.4-record block per object and
+		// roughly double the Avro file size on a real batch (see
+		// LEARNINGS.md). Batching every CheckpointEveryObjects objects
+		// (default 100) restores healthy block sizes while keeping the
+		// same durability property: the cursor still never advances past
+		// data that hasn't been flushed. A crash mid-batch just means the
+		// next run re-fetches and re-appends that batch's objects -- the
+		// same at-least-once/idempotent-replay model as before, just over
+		// a larger, tunable window instead of a hidden per-object one.
+		isLastObject := objectIndex == len(keys)-1
+		unflushedObjects := (objectIndex % cfg.CheckpointEveryObjects) + 1
+		if unflushedObjects >= cfg.CheckpointEveryObjects || isLastObject {
+			if err := sink.Flush(); err != nil {
+				return total, fmt.Errorf("flush after object %d (%s): %w", objectIndex, key, err)
+			}
+			cur.LastKey = key
+			if err := cursor.Save(cfg.CursorFile, cur); err != nil {
+				return total, fmt.Errorf("checkpoint after object %d (%s): %w", objectIndex, key, err)
+			}
+		}
 	}
 
 	span.SetAttributes(attribute.Int("records.written", total))

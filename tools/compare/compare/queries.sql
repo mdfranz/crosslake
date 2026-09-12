@@ -7,10 +7,14 @@
 -- DuckDB strategy").
 
 -- name: top_event_names
+-- ORDER BY needs a tiebreaker: CloudTrail has many eventNames tied at low
+-- counts, so `ORDER BY n DESC LIMIT 10` alone is non-deterministic at the
+-- cutoff -- caught by query_bench.py's result-hash check reporting
+-- views_match=False even when every view's full data actually agreed.
 SELECT eventName, count(*) AS n
 FROM {view}
 GROUP BY eventName
-ORDER BY n DESC
+ORDER BY n DESC, eventName ASC
 LIMIT 10;
 
 -- name: count_by_source

@@ -67,7 +67,23 @@ func New(dataDir string, schema avro.Schema) (*Sink, error) {
 	// interop gotcha, noted in LEARNINGS.md. Deflate is universally
 	// supported and still gives real compression, unlike the default
 	// (uncompressed) codec.
-	ocfEnc, err := ocf.NewEncoderWithSchema(schema, avroFile, ocf.WithCodec(ocf.Deflate))
+	//
+	// WithBlockLength raises the encoder's own automatic block boundary
+	// (default 100 records -- see hamba/avro/v2/ocf's Encoder default)
+	// well above it. Without this, cmd/poller's checkpoint batching
+	// (CheckpointEveryObjects) controls checkpoint *frequency* but not
+	// actual compression block size: the library's built-in 100-record
+	// default block length was still capping every block at ~100 records
+	// regardless of how infrequently Flush() was called, which is why
+	// raising the checkpoint interval alone did not fully fix the
+	// fragmentation measured in LEARNINGS.md. WithBlockSize is a memory
+	// safety cap in case very wide records would otherwise make 1000
+	// records occupy excessive buffered memory before compression.
+	ocfEnc, err := ocf.NewEncoderWithSchema(schema, avroFile,
+		ocf.WithCodec(ocf.Deflate),
+		ocf.WithBlockLength(1000),
+		ocf.WithBlockSize(4*1024*1024),
+	)
 	if err != nil {
 		rawFile.Close()
 		avroFile.Close()

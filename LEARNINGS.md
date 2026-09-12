@@ -42,6 +42,31 @@ local disk sinks, DuckDB comparisons.
    atomically replacing the cursor. Two files still are not a transaction, so a
    canonical raw landing plus derived outputs remains the target design.
 
+4a. **The per-object checkpoint fix (item 4) had a real, measured cost:
+   flush-per-object fragmented Avro into one ~2.4-record compression block
+   per S3 object, roughly doubling file size on a real batch (344KB -> 666KB
+   for ~1,490 records; Parquet, written in a separate Beam pass decoupled
+   from the poller's flush loop, was unaffected).** Confirmed by counting
+   actual OCF blocks with `fastavro.read.block_reader` (625 blocks, avg 2.38
+   records/block) and cross-checking against Logfire's own
+   `object.records_written` distribution -- they matched exactly. Two
+   separable causes, both fixed:
+   - `cmd/poller`'s checkpoint (flush + cursor save) ran after every single
+     object. Now batches every `checkpoint_every_objects` objects (default
+     100, configurable), always flushing on the last object of a poll too.
+     This widens the at-least-once replay window on crash from one object to
+     up to N objects -- not a new failure mode, the same
+     idempotent-replay/possible-duplicate model as before, just at a larger,
+     tunable grain.
+   - Independently, `hamba/avro/v2/ocf`'s `Encoder` has its own default
+     `BlockLength: 100` (records) that caps block size regardless of how
+     often `Flush()` is called -- raising the checkpoint interval alone
+     didn't fully fix it, since the encoder was still auto-closing a block
+     every 100 records. Fixed with `ocf.WithBlockLength(1000)` +
+     `ocf.WithBlockSize(4 MiB)` (a memory safety cap) in `disksink.go`.
+   Verified fix: 7 blocks, avg 215 records/block, 344KB for 1,507 records --
+   back at parity with the pre-regression baseline.
+
 5. **DuckDB's avro extension can't read hamba/avro's `zstandard`-codec OCF
    files** ("File header contains an unknown codec"), even though the file
    is spec-valid Avro. Switched both sides to `deflate`/`gzip` (same zlib
@@ -59,6 +84,26 @@ local disk sinks, DuckDB comparisons.
    "none." Before fixing this, both tiers looked *worse* than the original
    gzipped CloudTrail JSON, which would have been a misleading headline
    result. Fixed by explicitly setting a real codec on both sides.
+
+8. **`top_event_names`'s `ORDER BY n DESC LIMIT 10` had no tiebreaker**, so
+   `query_bench.py`'s new result-hash check correctly flagged
+   `views_match=False` even when the underlying data agreed -- CloudTrail
+   has many `eventName`s tied at low counts, so which ones land in the top
+   10 was non-deterministic across repeats. Fixed with `ORDER BY n DESC,
+   eventName ASC`. Left as a live example of the safeguard doing its job:
+   caught a real query bug that plain single-shot timing (the original
+   `query_bench.py`) would never have surfaced.
+
+9. **Testing against "today" as the S3 prefix reconfirmed the cohort-drift
+   risk `docs/review-telemetry-plan.md` predicted, live.** After fixing
+   item 8, *every* query still showed `views_match=False` -- not a
+   tiebreaker issue this time: `s3_baseline` had grown to 1,508 rows while
+   the local tiers (captured minutes earlier) were frozen at 1,507, because
+   CloudTrail kept delivering new events to "today"'s prefix during
+   testing. Any comparison against an open/live day will drift like this;
+   it isn't fixable by tuning a query. Practical workaround short of full
+   Phase 0 (manifest + reconciliation): point `s3_prefix` at a closed prior
+   day for any run where result stability matters.
 
 ## Comparison results
 
