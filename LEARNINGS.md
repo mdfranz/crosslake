@@ -178,6 +178,59 @@ that need a column `s3_baseline` doesn't expose:
     no pytest setup yet, and adding one is a bigger scope decision than
     this fix; live verification above stands in for it.
 
+## Optimization review (logfire-query skill)
+
+Reviewed real Logfire telemetry across all three services (aggregate
+duration by `span_name`) alongside the Go and Python source to find
+concrete optimization targets, not hypothetical ones.
+
+12. **`compare/db.py`'s `connect()` cost 8-9 seconds on every single
+    invocation of every `compare.*` tool, regardless of whether the query
+    touched S3 at all.** Isolated by timing each statement in `connect()`
+    separately: `INSTALL`/`LOAD` for `httpfs`/`avro` were already cached
+    (21ms, 11ms) -- the entire cost was `CREATE SECRET (TYPE s3, PROVIDER
+    credential_chain)`, at 8,053ms alone. DuckDB's default
+    `credential_chain` search order includes EC2 instance metadata (IMDS),
+    which times out (~1s/attempt, this isn't EC2) before falling through to
+    the environment variables that were the actual, already-valid
+    credential source the whole time. Fixed with `CHAIN 'env'`, restricting
+    the search to environment variables only: **8,053ms -> 26ms** for
+    secret creation, **9,395ms -> 1,425ms** for the full `connect()`
+    (extension `LOAD` accounts for the rest). Verified S3 access still
+    works (real `glob()`/query results unchanged) and `schema_inspect.py`
+    -- a tool that never touches S3 -- dropped from ~9.4s+ to under 2s
+    end-to-end. This was paid on every single `compare.*` run this entire
+    session (dozens of invocations); by far the highest-impact single fix
+    in this review. If auth here ever moves off static env-var credentials,
+    broaden to `CHAIN 'env;config;sts;sso'` -- still excluding `instance`.
+
+13. **The Go poller fetches S3 objects strictly sequentially** (a plain
+    `for objectIndex, key := range keys { FetchAndGunzip(...) }` loop, no
+    concurrency at all). Telemetry confirms this is the dominant remaining
+    cost on any real poll: `fetch_object`/`process_object` spans average
+    72-88ms each (network RTT-bound, not CPU-bound -- `write_record`'s own
+    per-record cost is ~64 microseconds, 1000x smaller), and a poll
+    against ~1,000+ objects took up to 141s wall-clock, purely from that
+    latency multiplying sequentially. S3 comfortably supports concurrent
+    `GetObject` calls; a bounded worker pool (e.g. 16-32 concurrent
+    fetches) would plausibly cut wall-clock poll time by an order of
+    magnitude for large/bursty batches. **Not implemented** -- this changes
+    core fetch-loop behavior (ordering guarantees for cursor advancement,
+    error handling under partial-batch failure) enough that it deserves a
+    deliberate decision, not a drive-by change during an optimization
+    pass. Flagged as the clear next target if poll latency matters more
+    than it currently does for this learning prototype's scale.
+
+14. Looked for but did not find a real optimization case in Go's
+    `canonicalJSONPtr` (allocates a new `bytes.Buffer` + `json.Encoder` per
+    escape-hatch field per record, up to 6 per record) or in Python's Beam
+    `DoFn` per-element overhead (inherent to `DirectRunner`, and the whole
+    point of this project is measuring Beam, not avoiding it). Both are
+    real allocation/overhead patterns, but S3 fetch dominates total wall
+    time by ~1000x at current scale (item 13's numbers), so neither would
+    move any real metric today. Worth revisiting only if item 13's fix
+    ever makes fetch latency small enough for these to become visible.
+
 ## Comparison results
 
 Real numbers from a batch of CloudTrail records pulled from live delivery

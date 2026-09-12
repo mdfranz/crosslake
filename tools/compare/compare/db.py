@@ -39,7 +39,17 @@ def connect(
     con = duckdb.connect()
     con.execute("INSTALL httpfs; LOAD httpfs;")
     con.execute("INSTALL avro; LOAD avro;")
-    con.execute("CREATE SECRET (TYPE s3, PROVIDER credential_chain);")
+    # CHAIN 'env' restricts DuckDB's AWS credential search to environment
+    # variables only. Without it, PROVIDER credential_chain's default search
+    # order also tries EC2 instance metadata (IMDS) -- a ~1s-per-attempt
+    # timeout since this never runs on EC2 -- adding up to a measured ~8s on
+    # every single connect(), regardless of whether any query touches S3.
+    # This is this project's dominant per-invocation cost by far (identified
+    # via `logfire-query` review: every compare.* tool pays this once at
+    # startup). If auth here ever moves off static env-var credentials
+    # (e.g. to an AWS profile/SSO), broaden to `CHAIN 'env;config;sts;sso'`
+    # -- still excluding 'instance', which is the slow one off EC2.
+    con.execute("CREATE SECRET (TYPE s3, PROVIDER credential_chain, CHAIN 'env');")
 
     s3_glob = f"s3://{bucket}/{prefix}/**/*.json.gz"
     parquet_glob = str(data_dir / "tier2-parquet" / "*.parquet")
