@@ -33,6 +33,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/mdfranz/crosslake/tools/poller/internal/atomicfile"
@@ -153,6 +154,22 @@ func (l *Ledger) Entries(bucket string) []Entry {
 	var entries []Entry
 	for _, e := range l.byID {
 		if e.Bucket == bucket {
+			entries = append(entries, e)
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
+	return entries
+}
+
+// EntriesUnder returns committed entries in bucket whose keys are under
+// prefix, sorted by key. A ledger can safely be reused for disjoint prefixes:
+// identity is still the complete bucket/key/etag tuple, but a manifest for
+// one prefix must not aggregate entries committed while a different prefix
+// was configured. An empty prefix intentionally matches every key.
+func (l *Ledger) EntriesUnder(bucket, prefix string) []Entry {
+	var entries []Entry
+	for _, e := range l.byID {
+		if e.Bucket == bucket && strings.HasPrefix(e.Key, prefix) {
 			entries = append(entries, e)
 		}
 	}

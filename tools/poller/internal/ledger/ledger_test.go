@@ -116,3 +116,15 @@ func TestMissingIsBucketScoped(t *testing.T) {
 		t.Fatalf("Missing across buckets = %v, want the object reported missing for bucket-b", got)
 	}
 }
+
+func TestEntriesUnderScopesToPrefix(t *testing.T) {
+	l := New()
+	l.Record("b", "CloudTrail/us-east-1/2026/09/10/a.json.gz", "e1", 1, 1)
+	l.Record("b", "CloudTrail/us-east-1/2026/09/11/b.json.gz", "e2", 2, 2)
+	l.Record("other-bucket", "CloudTrail/us-east-1/2026/09/10/c.json.gz", "e3", 3, 3)
+
+	got := l.EntriesUnder("b", "CloudTrail/us-east-1/2026/09/10/")
+	if len(got) != 1 || got[0].Key != "CloudTrail/us-east-1/2026/09/10/a.json.gz" {
+		t.Fatalf("EntriesUnder returned %v, want only the matching bucket/prefix entry", got)
+	}
+}

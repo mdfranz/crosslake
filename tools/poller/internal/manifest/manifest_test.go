@@ -26,9 +26,9 @@ func TestCohortIDDiffersAcrossPrefix(t *testing.T) {
 
 func TestBuildAggregatesLedgerEntries(t *testing.T) {
 	l := ledger.New()
-	l.Record("b", "obj1", "etag1", 100, 5)
-	l.Record("b", "obj2", "etag2", 200, 7)
-	l.Record("other-bucket", "obj3", "etag3", 999, 999) // must not leak into b's totals
+	l.Record("b", "prefix/obj1", "etag1", 100, 5)
+	l.Record("b", "prefix/obj2", "etag2", 200, 7)
+	l.Record("other-bucket", "prefix/obj3", "etag3", 999, 999) // must not leak into b's totals
 
 	started := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
 	doc := Build(l, "b", "prefix/", []byte(`{"fake":"schema"}`), started)
@@ -59,17 +59,28 @@ func TestBuildAggregatesLedgerEntries(t *testing.T) {
 	}
 }
 
+func TestBuildScopesLedgerEntriesToManifestPrefix(t *testing.T) {
+	l := ledger.New()
+	l.Record("b", "CloudTrail/us-east-1/2026/09/10/obj1", "etag1", 100, 5)
+	l.Record("b", "CloudTrail/us-east-1/2026/09/11/obj2", "etag2", 200, 7)
+
+	doc := Build(l, "b", "CloudTrail/us-east-1/2026/09/10/", []byte(`{"fake":"schema"}`), time.Now())
+	if doc.ObjectCount != 1 || doc.TotalBytes != 100 || doc.TotalRecords != 5 {
+		t.Fatalf("Build included entries outside the manifest prefix: %+v", doc)
+	}
+}
+
 func TestObjectsFingerprintIsOrderIndependent(t *testing.T) {
 	started := time.Now()
 	schema := []byte(`{"fake":"schema"}`)
 
 	l1 := ledger.New()
-	l1.Record("b", "obj1", "etag1", 1, 1)
-	l1.Record("b", "obj2", "etag2", 1, 1)
+	l1.Record("b", "prefix/obj1", "etag1", 1, 1)
+	l1.Record("b", "prefix/obj2", "etag2", 1, 1)
 
 	l2 := ledger.New()
-	l2.Record("b", "obj2", "etag2", 1, 1) // recorded in the opposite order
-	l2.Record("b", "obj1", "etag1", 1, 1)
+	l2.Record("b", "prefix/obj2", "etag2", 1, 1) // recorded in the opposite order
+	l2.Record("b", "prefix/obj1", "etag1", 1, 1)
 
 	doc1 := Build(l1, "b", "prefix/", schema, started)
 	doc2 := Build(l2, "b", "prefix/", schema, started)
@@ -84,11 +95,11 @@ func TestObjectsFingerprintChangesWithObjectSet(t *testing.T) {
 	schema := []byte(`{"fake":"schema"}`)
 
 	l1 := ledger.New()
-	l1.Record("b", "obj1", "etag1", 1, 1)
+	l1.Record("b", "prefix/obj1", "etag1", 1, 1)
 
 	l2 := ledger.New()
-	l2.Record("b", "obj1", "etag1", 1, 1)
-	l2.Record("b", "obj2", "etag2", 1, 1)
+	l2.Record("b", "prefix/obj1", "etag1", 1, 1)
+	l2.Record("b", "prefix/obj2", "etag2", 1, 1)
 
 	doc1 := Build(l1, "b", "prefix/", schema, started)
 	doc2 := Build(l2, "b", "prefix/", schema, started)
@@ -100,7 +111,7 @@ func TestObjectsFingerprintChangesWithObjectSet(t *testing.T) {
 
 func TestSaveLoadRoundTrip(t *testing.T) {
 	l := ledger.New()
-	l.Record("b", "obj1", "etag1", 100, 5)
+	l.Record("b", "prefix/obj1", "etag1", 100, 5)
 	doc := Build(l, "b", "prefix/", []byte(`{"fake":"schema"}`), time.Now())
 
 	path := filepath.Join(t.TempDir(), "ledger.manifest.json")

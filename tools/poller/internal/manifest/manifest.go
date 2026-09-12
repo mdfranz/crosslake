@@ -132,11 +132,14 @@ func objectsFingerprint(entries []ledger.Entry) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// Build computes a Document from the ledger's current state for bucket, as
-// of a run that started at startedAt. schemaBytes is the raw
+// Build computes a Document from the ledger's current state under
+// (bucket, prefix), as of a run that started at startedAt. Filtering by
+// prefix is essential when a user reuses one ledger for several disjoint
+// prefixes: the document must describe the cohort named in Prefix, not every
+// object ever committed in that bucket. schemaBytes is the raw
 // cloudtrail.avsc content (Build hashes it; it doesn't parse it).
 func Build(l *ledger.Ledger, bucket, prefix string, schemaBytes []byte, startedAt time.Time) Document {
-	entries := l.Entries(bucket)
+	entries := l.EntriesUnder(bucket, prefix)
 	var totalBytes int64
 	var totalRecords int
 	for _, e := range entries {

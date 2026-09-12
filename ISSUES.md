@@ -68,3 +68,24 @@ and `internal/manifest`'s `Document`:
 
 Not started as of the `ledger-and-manifest` branch (ledger + run/cohort
 manifest landed; see `LEARNINGS.md` #20-22).
+
+## Manifest object fingerprints are recorded but not yet verified live
+
+`internal/manifest` correctly stores an order-independent fingerprint of the
+source `(key, etag)` set. However, `tools/compare/compare/manifest.py` only
+compares manifest object count, compressed bytes, and record counts. Its
+DuckDB `read_blob` inventory exposes object names and sizes but not S3 ETags,
+so `objects_fingerprint` is currently provenance for a human to inspect, not
+a fail-closed reconciliation check.
+
+This leaves a narrow false-green case: source objects can be replaced while
+preserving the same count, compressed-byte total, and record count. If the
+derived tiers are then regenerated, the current checks can all pass even
+though the object cohort differs from the recorded ingest cohort.
+
+Add an authenticated S3 inventory path that obtains key + ETag (for example,
+via a small AWS SDK-backed helper or a versioned S3 Inventory export), compute
+the same sorted fingerprint, and add it to `compare.manifest.check` as a
+required check. The implementation must keep raw keys, ETags, bucket names,
+and account identifiers local: emit only the aggregate fingerprint and a
+categorized pass/fail result to reports and telemetry.
