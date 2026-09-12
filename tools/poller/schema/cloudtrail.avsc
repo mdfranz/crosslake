@@ -1,0 +1,60 @@
+{
+  "type": "record",
+  "name": "CloudTrailEvent",
+  "namespace": "com.crosslake.cloudtrail",
+  "doc": "Tier 3 typed CloudTrail record. Field list grounded in a real record sampled from live CloudTrail delivery (see docs/schema-design-notes.md), not the AWS docs alone. Event-type-dependent nested blobs are kept as JSON-string escape hatches rather than strict per-service records, since their shape varies by eventName/eventSource -- mirrored in pipelines/parquet-writer/parquet_writer/cloudtrail_schema.py for a fair Avro/Parquet comparison.",
+  "fields": [
+    { "name": "eventVersion", "type": ["null", "string"], "default": null },
+    {
+      "name": "eventTime",
+      "type": ["null", { "type": "long", "logicalType": "timestamp-millis" }],
+      "default": null,
+      "doc": "Genuinely typed (not string) on purpose -- a real comparison point against Tier 1's generic envelope and Tier 2's pyarrow timestamp column."
+    },
+    { "name": "eventSource", "type": ["null", "string"], "default": null },
+    { "name": "eventName", "type": ["null", "string"], "default": null },
+    { "name": "eventType", "type": ["null", "string"], "default": null },
+    { "name": "eventCategory", "type": ["null", "string"], "default": null },
+    { "name": "awsRegion", "type": ["null", "string"], "default": null },
+    { "name": "sourceIPAddress", "type": ["null", "string"], "default": null },
+    { "name": "userAgent", "type": ["null", "string"], "default": null },
+    { "name": "requestID", "type": ["null", "string"], "default": null },
+    { "name": "eventID", "type": ["null", "string"], "default": null },
+    { "name": "sharedEventID", "type": ["null", "string"], "default": null },
+    { "name": "recipientAccountId", "type": ["null", "string"], "default": null },
+    { "name": "readOnly", "type": ["null", "boolean"], "default": null },
+    { "name": "managementEvent", "type": ["null", "boolean"], "default": null },
+    {
+      "name": "userIdentity",
+      "doc": "Real samples show this varies materially by `type` (AWSService only has invokedBy; IAMUser/AssumedRole carry arn/accountId/accessKeyId; AssumedRole nests session info) -- superset of the stable scalar fields, plus a JSON escape hatch for the rest.",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "UserIdentity",
+          "fields": [
+            { "name": "type", "type": ["null", "string"], "default": null },
+            { "name": "principalId", "type": ["null", "string"], "default": null },
+            { "name": "arn", "type": ["null", "string"], "default": null },
+            { "name": "accountId", "type": ["null", "string"], "default": null },
+            { "name": "accessKeyId", "type": ["null", "string"], "default": null },
+            { "name": "userName", "type": ["null", "string"], "default": null },
+            { "name": "invokedBy", "type": ["null", "string"], "default": null },
+            {
+              "name": "sessionContextJson",
+              "type": ["null", "string"],
+              "default": null,
+              "doc": "Raw JSON of userIdentity.sessionContext (present for AssumedRole) -- deeply nested and shaped per role, not worth a strict schema."
+            }
+          ]
+        }
+      ],
+      "default": null
+    },
+    { "name": "requestParametersJson", "type": ["null", "string"], "default": null },
+    { "name": "responseElementsJson", "type": ["null", "string"], "default": null },
+    { "name": "additionalEventDataJson", "type": ["null", "string"], "default": null },
+    { "name": "resourcesJson", "type": ["null", "string"], "default": null },
+    { "name": "serviceEventDetailsJson", "type": ["null", "string"], "default": null }
+  ]
+}

@@ -1,0 +1,18 @@
+# Copy to config.yaml (gitignored) and fill in your own values.
+# See PLAN.md ("Poller (Go, tools/poller)") and AGENTS.md before committing
+# anything derived from this file -- never put a real bucket/account here.
+
+mode: local # local|pubsub (only local is implemented so far)
+
+aws:
+  region: us-east-1
+  s3_bucket: example-cloudtrail-bucket
+  # Narrow this to one account/region to keep local runs fast; ListObjectsV2
+  # is paginated but CloudTrail buckets can hold years of history.
+  s3_prefix: AWSLogs/123456789012/CloudTrail/us-east-1/
+
+local:
+  data_dir: ../../data # repo-root ./data -- run poller from tools/poller (see Makefile)
+
+cursor_file: ./cursor.json # tools/poller/cursor.json, gitignored
+poll_interval_seconds: 60

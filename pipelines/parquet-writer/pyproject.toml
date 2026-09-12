@@ -1,0 +1,16 @@
+[project]
+name = "crosslake-parquet-writer"
+version = "0.1.0"
+description = "Beam pipeline that parses CloudTrail JSON off cloudtrail-raw (or a local .jsonl sample) and writes typed columnar Parquet (Tier 2)."
+requires-python = ">=3.14"
+dependencies = [
+    "apache-beam>=2.58",
+    "logfire>=2.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["parquet_writer"]

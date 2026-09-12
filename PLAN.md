@@ -1,5 +1,42 @@
 # CloudTrail (S3) → Pub/Sub → GCS: Avro vs Parquet Learning Pipeline
 
+## Status (as of first Local Mode build)
+
+**Built and verified end-to-end: Local Mode only.** Real AWS S3 CloudTrail
+records flow through `tools/poller` (Go) → `./data/raw.jsonl` +
+`./data/tier3-avro/events.avro` → `pipelines/parquet-writer` (Beam,
+DirectRunner) → `./data/tier2-parquet/*.parquet` → `tools/compare` (DuckDB).
+All three components ship OpenTelemetry traces to one Logfire project. See
+`LEARNINGS.md` for real results and bugs found/fixed along the way, and
+`docs/runbook.md` for the exact commands.
+
+**Not built yet:** everything GCP (Pulumi stacks, Pub/Sub topics/schema,
+GCS subscriptions, Dataflow) -- Cloud Mode below is still the target design
+for that half, just deferred. A few specifics changed from the original
+design once real data and real tools were involved; where this doc still
+describes the original intent, `LEARNINGS.md` and `docs/` note what
+actually happened:
+
+- **Python**: `>=3.14`, managed with `uv` (not raw `pip`/`venv`) -- picked
+  when the environment turned out to already have `uv` and no system `pip`.
+  Apache Beam 2.76 and DirectRunner both work fine on 3.14, confirmed before
+  committing to it.
+- **Observability token**: this environment's `LOGFIRE_API_TOKEN` is scoped
+  for the Logfire Claude Code plugin's own API calls, not OTLP ingestion --
+  a real project write token (`uvx logfire --region=us auth` +
+  `projects use`) is required instead. See `docs/observability.md`.
+- **Avro/Parquet codec**: both `hamba/avro/v2/ocf` and Beam's
+  `WriteToParquet` default to *no* compression, which silently makes any
+  "vs. gzip" size comparison look wrong. Both are explicitly set to
+  deflate/gzip. DuckDB's `avro` extension additionally can't read
+  `zstandard`-codec OCF files, ruling that codec out for Tier 3 as long as
+  DuckDB is a consumer.
+- **Beam span parenting**: `DoFn.process()` runs outside the OTEL context
+  opened in `main()`, so per-record spans need an explicit W3C
+  `traceparent` re-attached in each call or they land as orphaned root
+  traces instead of children of the pipeline-run span. See
+  `docs/observability.md`.
+
 ## Context
 
 The user wants hands-on understanding of stream processing across object storage,
@@ -90,15 +127,43 @@ noted as future work only).
   (`CREATE SECRET (TYPE s3, PROVIDER credential_chain)`). Workload Identity
   Federation (AWS→GCP) is documented as the upgrade path before this runs
   unattended, not built now.
+- **Observability: Logfire (Python) + OpenTelemetry (Go), one destination**:
+  `LOGFIRE_TOKEN` is already set in the environment, so every component ships
+  traces (and, where cheap, metrics) to the same Logfire project from day one —
+  this doubles as a fourth, cross-cutting comparison lens (per-tier publish/
+  write/query latency, side by side, without hand-rolled timing code).
+  - **Python components** (`pipelines/parquet-writer`, `tools/compare`) use the
+    `logfire` SDK directly: `pip install logfire`, `logfire.configure()` reads
+    `LOGFIRE_TOKEN` from the environment with zero extra config. Beam DoFns get
+    manual spans/counters around parse success/failure; `tools/compare` wraps
+    each DuckDB query (S3 baseline, Tier 2 Parquet, Tier 3 Avro) in a
+    `with logfire.span(...)` so the three tiers' query latencies land as
+    directly comparable traces in the same project.
+  - **Go poller** uses vanilla `go.opentelemetry.io/otel` (no Logfire-specific
+    Go package exists) exporting OTLP/HTTP straight to Logfire's OTLP endpoint
+    — Logfire ingests standard OTLP, so no local Collector is needed. Three
+    env vars point the SDK at it: `OTEL_EXPORTER_OTLP_ENDPOINT=https://logfire-us.pydantic.dev`,
+    `OTEL_EXPORTER_OTLP_HEADERS=Authorization=$LOGFIRE_TOKEN`,
+    `OTEL_SERVICE_NAME=crosslake-poller` (use `logfire-eu.pydantic.dev` instead
+    if the project is EU-region). Spans: one per `RunOnce` pass, one per S3
+    object fetched/gunzipped, one per record published (tagged `sink=raw` /
+    `sink=avro` and `mode=local` / `mode=pubsub` so cloud vs. local runs are
+    filterable in the same view).
+  - Each component sets a distinct `OTEL_SERVICE_NAME`/`service_name`
+    (`crosslake-poller`, `crosslake-parquet-writer`, `crosslake-compare`) so
+    the three tiers stay distinguishable in one Logfire project rather than
+    needing three separate projects.
 
 ## Repo layout
 
 ```
 crosslake/
   README.md, LEARNINGS.md (living comparison notes), Makefile, .gitignore
+  .env.example                 # LOGFIRE_TOKEN, OTEL_EXPORTER_OTLP_*, OTEL_SERVICE_NAME
   docs/
     architecture.md            # diagram + prose of the 3-tier design
     schema-design-notes.md     # source of truth for CloudTrail field typing
+    observability.md           # Logfire/OTEL setup, service names, dashboards/saved queries
     runbook.md                 # verification steps (mirrors "Build order" below)
   infra/pulumi/
     gcp/   index.ts, pubsub.ts, gcs.ts, iam.ts, apis.ts
@@ -111,11 +176,12 @@ crosslake/
       internal/disksink/       # Local sink: writes raw.jsonl + typed Avro OCF
       internal/avroenc/        # hamba/avro against schema/cloudtrail.avsc
       internal/cursor/         # local JSON cursor file
+      internal/telemetry/      # OTEL TracerProvider setup (OTLP/HTTP → Logfire), span helpers
       schema/cloudtrail.avsc
       config.example.yaml
-    compare/                   # Python + DuckDB: sizes.py, schema_inspect.py, query_bench.py, queries.sql, report.py
+    compare/                   # Python + DuckDB: sizes.py, schema_inspect.py, query_bench.py, queries.sql, report.py, telemetry.py (logfire.configure())
   pipelines/parquet-writer/    # Python/Beam
-    parquet_writer/pipeline.py, transforms.py, cloudtrail_schema.py
+    parquet_writer/pipeline.py, transforms.py, cloudtrail_schema.py, telemetry.py (logfire.configure())
     scripts/run_local.sh (DirectRunner), run_dataflow.sh (DataflowRunner)
   data/                        # Local mode outputs (.gitignored)
     raw.jsonl                  # Mirrored raw topic stream
@@ -200,6 +266,14 @@ buckets, for a simpler IAM surface.
 - Portability seam: core logic in `RunOnce(ctx) error` (one poll→fetch→parse→
   publish→cursor-update pass); `main.go` wraps it in a ticker loop locally.
   Same function becomes a Cloud Run Job/Lambda handler later.
+- **Telemetry (`internal/telemetry`)**: `otel.SetTracerProvider` wired to an
+  `otlptracehttp` exporter reading `OTEL_EXPORTER_OTLP_ENDPOINT` /
+  `OTEL_EXPORTER_OTLP_HEADERS` / `OTEL_SERVICE_NAME` from the environment
+  (set via `.env`/Makefile, pointed at Logfire — see Observability section
+  below). `RunOnce` opens a root span; each S3 object and each published
+  record gets a child span with `mode`/`sink` attributes. **Gotcha**: `--once`
+  runs are short-lived, so `main.go` must call `tracerProvider.Shutdown(ctx)`
+  (or `ForceFlush`) before exit or the batched exporter drops the last spans.
 - **CloudTrail schema shape** (central design challenge, called out
   explicitly): typed fields for the stable envelope (`eventVersion`,
   `eventTime`, `eventSource`, `eventName`, `awsRegion`, `sourceIPAddress`,
@@ -220,7 +294,11 @@ mirroring the Avro field list. `userIdentity` kept as a **nested struct column**
 (a deliberate point of comparison — Parquet's native nested-column support vs.
 the Avro record). Dual input mode (`--input_mode=file|pubsub`) lets pipeline
 logic be iterated for free against a saved `.jsonl` sample on `DirectRunner`
-before touching Dataflow/billing.
+before touching Dataflow/billing. `telemetry.py` calls `logfire.configure()`
+once at pipeline start; `ParseCloudTrailJson` wraps each element in a
+`logfire.span("parse_record")` and increments `logfire.metric_counter`s for
+parsed vs. rejected records — cheap on `DirectRunner`, and still cheap on
+Dataflow workers since the SDK batches export in the background.
 
 Dataflow job itself is **not** a Pulumi-managed resource (that resource type
 targets template artifacts; a custom Beam pipeline would need a Flex Template
@@ -229,10 +307,50 @@ the pipeline is launched imperatively via `scripts/run_dataflow.sh`, run for a
 short bounded window, then explicitly cancelled (`gcloud dataflow jobs
 cancel`) — streaming Dataflow bills continuously.
 
+## Observability (Logfire + OpenTelemetry)
+
+One Logfire project, three service names, no separate Collector:
+
+- **Setup**: `LOGFIRE_TOKEN` is already exported in the shell environment
+  (confirm region: US default is `https://logfire-us.pydantic.dev`; use
+  `https://logfire-eu.pydantic.dev` if the project was created in the EU).
+  `.env.example` documents the full variable set so both the Go and Python
+  sides pick it up the same way locally and in `make` targets:
+  ```
+  LOGFIRE_TOKEN=...
+  OTEL_EXPORTER_OTLP_ENDPOINT=https://logfire-us.pydantic.dev
+  OTEL_EXPORTER_OTLP_HEADERS=Authorization=${LOGFIRE_TOKEN}
+  OTEL_SERVICE_NAME=crosslake-poller
+  ```
+- **Python (`pipelines/parquet-writer`, `tools/compare`)**: `pip install
+  logfire`; `logfire.configure()` picks up `LOGFIRE_TOKEN` with no other
+  arguments (pass `service_name=` explicitly per component). No Beam-specific
+  Logfire integration exists, so instrumentation is manual spans/counters in
+  the DoFns and in `tools/compare`'s query functions — this is deliberate:
+  wrapping the Tier 1/2/3 DuckDB queries in spans turns the comparison
+  benchmark into live, queryable traces instead of a one-off `report.py`
+  printout, and results can be pulled back with `logfire query` for
+  `LEARNINGS.md`.
+- **Go (`tools/poller`)**: no Logfire-branded Go SDK exists (Logfire's Go
+  guidance is "bring your own OpenTelemetry SDK"), so `internal/telemetry`
+  uses stock `go.opentelemetry.io/otel` + `otlptracehttp`, pointed at Logfire
+  purely via the three `OTEL_EXPORTER_OTLP_*`/`OTEL_SERVICE_NAME` env vars —
+  no code-level Logfire dependency at all.
+- **Cross-cutting payoff**: because both sides emit OTLP into the same
+  project, a single trace waterfall can in principle span "poller published →
+  GCS subscription wrote Tier 1/3 → Beam parsed → Parquet flushed" if trace
+  context is propagated via Pub/Sub message attributes (`traceparent`) —
+  called out as a stretch goal, not required for the core comparison, since
+  each tier's spans are independently useful even unlinked.
+- **Verification**: after each smoke test (local and cloud), check the
+  Logfire live view for the corresponding `service_name` and confirm spans
+  landed with the expected `mode`/`sink`/`tier` attributes before moving on.
+
 ## Build / verification order
 
 1. Scaffold directories + stub manifests (`go.mod`, `pyproject.toml`,
-   `package.json`), `.gitignore` (including `/data/`), README/LEARNINGS skeletons.
+   `package.json`), `.gitignore` (including `/data/`), README/LEARNINGS skeletons,
+   `.env.example` (`LOGFIRE_TOKEN`, `OTEL_EXPORTER_OTLP_*`, `OTEL_SERVICE_NAME`).
 2. `pulumi up` in `infra/pulumi/aws` → verify credentials can read the CloudTrail
    S3 prefix and cannot touch other buckets/prefixes.
 3. **Local Mode End-to-End Smoke Test (Zero GCP cost / instant feedback)**:
@@ -248,6 +366,10 @@ cancel`) — streaming Dataflow bills continuously.
      - Local Tier 3: `SELECT ... FROM read_avro('./data/tier3-avro/*.avro')`
    - *Payoff*: Validate all schema mappings, gunzip unnesting, and Parquet/Avro
      encoding in seconds before spinning up any GCP infrastructure.
+   - Check the Logfire live view: `crosslake-poller` spans from the `--once`
+     run, and `crosslake-parquet-writer` spans from the `DirectRunner` pass —
+     confirms OTLP export and `Shutdown()`/flush both work before cloud costs
+     start accruing.
 4. `pulumi up` in `infra/pulumi/gcp` → provision GCP Pub/Sub topics, schemas,
    bucket, and subscriptions. Verify with `gcloud pubsub topics list`, `gsutil ls`.
 5. `make poller-config` — generate poller config from `pulumi stack output
@@ -272,7 +394,9 @@ cancel`) — streaming Dataflow bills continuously.
     republish one record with an added field and observe how each format's
     readers handle it — Avro's writer/reader schema resolution vs. Parquet's
     per-file footer schema needing explicit schema-unification on read (PyArrow
-    `unify_schemas` / DuckDB `union_by_name`).
+    `unify_schemas` / DuckDB `union_by_name`). Pull the per-tier query-latency
+    spans back from Logfire (`crosslake-compare` service) to corroborate the
+    manual timings in `LEARNINGS.md`.
 11. `pulumi destroy` (or at minimum cancel the Dataflow job) between sessions —
     ongoing cost surface is Dataflow workers, not idle Pub/Sub/GCS.
 
@@ -300,6 +424,15 @@ cancel`) — streaming Dataflow bills continuously.
 - Cursor file has no locking — fine solo, but never run two poller instances
   concurrently.
 - Streaming Dataflow bills continuously — remember to cancel test runs.
+- OTEL Go SDK batches spans in the background; a short-lived `--once` process
+  that exits without `tracerProvider.Shutdown(ctx)` silently drops unflushed
+  spans (no error) — easy to mistake for "the poller ran fine, telemetry is
+  just broken."
+- Missing/wrong `OTEL_SERVICE_NAME` shows spans as `unknown_service` in
+  Logfire, making the three components indistinguishable in one project.
+- US vs. EU Logfire region is endpoint-selected (`logfire-us` vs.
+  `logfire-eu.pydantic.dev`); pointing at the wrong region silently sends data
+  nowhere useful rather than erroring.
 
 ## Explicit future work (not built now)
 
@@ -315,5 +448,7 @@ Structured Streaming as an alternative Tier 2 implementation, for comparison.
 
 - `infra/pulumi/gcp/pubsub.ts`, `infra/pulumi/gcp/iam.ts`
 - `tools/poller/schema/cloudtrail.avsc`, `tools/poller/cmd/poller/main.go`
+- `tools/poller/internal/telemetry/telemetry.go`
 - `pipelines/parquet-writer/parquet_writer/pipeline.py`
 - `tools/compare/compare/sizes.py`
+- `.env.example`
