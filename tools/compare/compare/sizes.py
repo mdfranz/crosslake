@@ -14,14 +14,23 @@ from compare import telemetry
 from compare.db import DEFAULT_DATA_DIR, DEFAULT_POLLER_CONFIG, connect, load_poller_config
 
 
-def s3_gzip_total_bytes(con: duckdb.DuckDBPyConnection, bucket: str, prefix: str) -> tuple[int, int]:
-    """Returns (object_count, total_compressed_bytes) for the same prefix
-    the poller pulled from, via S3's own object listing (not a JSON parse)."""
-    glob = f"s3://{bucket}/{prefix.rstrip('/')}/**/*.json.gz"
-    n_files, total = con.execute(
-        f"SELECT count(*), coalesce(sum(size), 0) FROM read_blob('{glob}')"
-    ).fetchone()
-    return n_files, total
+def s3_gzip_total_bytes(con: duckdb.DuckDBPyConnection, bucket: str, prefixes: list[str]) -> tuple[int, int]:
+    """Returns (object_count, total_compressed_bytes) summed across all
+    prefixes, via S3's own object listing (not a JSON parse). Must be
+    called with the *same* prefix list compare.db.connect() used to build
+    s3_baseline (see its aws.s3_prefixes docstring) -- this function used
+    to always read the single aws.s3_prefix regardless of s3_prefixes,
+    silently measuring the wrong cohort's size whenever they differed."""
+    n_files_total = 0
+    bytes_total = 0
+    for prefix in prefixes:
+        glob = f"s3://{bucket}/{prefix.rstrip('/')}/**/*.json.gz"
+        n_files, total = con.execute(
+            f"SELECT count(*), coalesce(sum(size), 0) FROM read_blob('{glob}')"
+        ).fetchone()
+        n_files_total += n_files
+        bytes_total += total
+    return n_files_total, bytes_total
 
 
 def local_file_bytes(path: Path) -> int:
@@ -34,10 +43,9 @@ def run(data_dir: Path = DEFAULT_DATA_DIR, poller_config_path: Path = DEFAULT_PO
     cfg = load_poller_config(poller_config_path)
     con = connect(data_dir, poller_config_path)
 
+    prefixes = cfg["aws"].get("s3_prefixes") or [cfg["aws"]["s3_prefix"]]
     with logfire.span("sizes.s3_baseline"):
-        n_files, s3_gzip_bytes = s3_gzip_total_bytes(
-            con, cfg["aws"]["s3_bucket"], cfg["aws"]["s3_prefix"]
-        )
+        n_files, s3_gzip_bytes = s3_gzip_total_bytes(con, cfg["aws"]["s3_bucket"], prefixes)
 
     raw_jsonl_bytes = local_file_bytes(data_dir / "raw.jsonl")
     tier2_bytes = local_file_bytes(data_dir / "tier2-parquet")

@@ -309,6 +309,67 @@ fresh instrumentation job, looking for gaps in what's already there.
     confirmed directly; `crosslake-parquet-writer` uses the same
     `telemetry.py` pattern as `crosslake-compare`).
 
+## 2-day real ingest test (09/10 + 09/11, closed days)
+
+First test run using every fix above together: concurrent fetch,
+checkpoint batching, canonical JSON, the outer-span status fix, and (new
+this round) a genuine matching cohort across *two* days.
+
+19. **`compare/db.py`'s `s3_baseline` view only ever supported a single
+    `aws.s3_prefix`, but the local tiers now often span more than one
+    (after a multi-day `--s3-prefix` ingest like this one).** Added
+    `aws.s3_prefixes` (a list, optional, additive -- the Go poller doesn't
+    read it and ignores it harmlessly) that `connect()` now folds into
+    `read_json`'s multi-glob file-list argument. Confirmed DuckDB's
+    `glob()` does *not* support brace expansion (`{10,11}` matched 0
+    files); `read_json`/`read_parquet`'s own list-of-globs argument does
+    (tested directly: 1,759 objects, matching the real ingest exactly).
+    **Caught immediately after "fixing" it**: `sizes.py` has its own,
+    separate S3-byte-counting function that still only read the single
+    `aws.s3_prefix` (today, unrelated to the two ingested days) -- the
+    exact cohort-mismatch failure mode this project has hit repeatedly,
+    recurring in a spot my own new feature didn't touch. First run showed
+    both formats *worse* than gzip (1.17x, 1.30x) purely because the
+    baseline was measuring the wrong 4 days' data; fixed by making
+    `s3_gzip_total_bytes` sum across the same prefix list, verified by the
+    ratio landing back at 0.42x/0.47x -- consistent with the original
+    single-day result once the cohort was actually the same one twice.
+
+Real, verified results:
+
+- **Ingest**: 882 + 877 = 1,759 objects, 4,491 records, in 9.30s + 9.51s
+  (18.8s total, ~10.7ms/object effective -- consistent with item 13's ~8x
+  concurrent-fetch speedup on an independent run). Fetch latency
+  distribution (real `fetch_object` spans): p50 137ms, p95 287ms, p99
+  390ms, max 486ms -- individually *higher* than the old sequential
+  baseline (88ms/object) because 16 concurrent requests now contend for
+  the connection pool, but net throughput is what improved.
+- **Beam -> Parquet**: 4,491 records in 6.0s, 0 rejects.
+- **Data integrity**: `raw.jsonl`, Tier 2 Parquet row count, and Tier 3
+  Avro row count all agree exactly (4,491), and -- new this round --
+  `s3_baseline` does too (item 19's fix), so every `query_bench.py` query
+  reported `views_match: True`, including the S3-touching ones. Both days
+  are closed (not "today"), so none of them hit the live-day cohort drift
+  from item 9 -- direct confirmation that testing against closed prefixes
+  avoids it, exactly as `docs/review-telemetry-plan.md` recommended.
+- **Sizes** (now on a real matching cohort): 770KB * 2 days ~ 2MB gzip
+  original vs. 904KB Parquet (0.42x) / 1,002KB Avro (0.47x) -- matches the
+  original single-day ratios closely.
+- **Encode** (`fastavro`/`pyarrow`, same process, same rows): Parquet 86.4ms
+  median (51,969 records/sec, 928,833 bytes) vs. Avro 126.7ms (35,432
+  records/sec, 1,270,248 bytes) -- Parquet's edge is *larger* here (~32%
+  faster, ~27% smaller) than on the original ~1,450-record batch (~15%
+  faster, ~7% smaller). Worth watching whether that gap keeps widening
+  with scale or is still just batch-to-batch noise.
+- **Query latency scaling, comparing to the original single-day
+  (~1,500-record) numbers**: Parquet's query times grew *sub-linearly*
+  with 3x the data (e.g. `top_event_names` 3.1ms -> 5.9ms, under 2x) while
+  Avro's grew close to *linearly* (9.4ms -> 27.1ms, ~3x) -- consistent
+  with columnar pruning/compression benefiting Parquet more as data grows,
+  while Avro's row-oriented format must deserialize every row regardless
+  of which columns a query actually needs. One data point, not a curve --
+  worth a larger/repeated-scale test before trusting the trend.
+
 ## Comparison results
 
 Real numbers from a batch of CloudTrail records pulled from live delivery

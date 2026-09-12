@@ -34,7 +34,14 @@ def connect(
 ) -> duckdb.DuckDBPyConnection:
     cfg = load_poller_config(poller_config_path)
     bucket = cfg["aws"]["s3_bucket"]
-    prefix = cfg["aws"]["s3_prefix"].rstrip("/")
+    # aws.s3_prefixes (a list) takes precedence over the single aws.s3_prefix
+    # the poller itself uses, for comparing against a cohort spanning more
+    # than one day/prefix -- e.g. after ingesting several days via the
+    # poller's --s3-prefix override. tools/poller/cmd/poller/config.go
+    # doesn't recognize this key and yaml.Unmarshal ignores it harmlessly;
+    # it's additive and compare-only, never read by the poller.
+    prefixes = cfg["aws"].get("s3_prefixes") or [cfg["aws"]["s3_prefix"]]
+    prefixes = [p.rstrip("/") for p in prefixes]
 
     con = duckdb.connect()
     con.execute("INSTALL httpfs; LOAD httpfs;")
@@ -51,7 +58,11 @@ def connect(
     # -- still excluding 'instance', which is the slow one off EC2.
     con.execute("CREATE SECRET (TYPE s3, PROVIDER credential_chain, CHAIN 'env');")
 
-    s3_glob = f"s3://{bucket}/{prefix}/**/*.json.gz"
+    # DuckDB's glob() doesn't support brace expansion (`{10,11}` matches
+    # nothing, confirmed by testing) -- read_json's own file-list argument
+    # does accept a Python-style list of globs, one per prefix.
+    s3_globs = [f"s3://{bucket}/{p}/**/*.json.gz" for p in prefixes]
+    s3_glob_list = "[" + ", ".join(f"'{g}'" for g in s3_globs) + "]"
     parquet_glob = str(data_dir / "tier2-parquet" / "*.parquet")
     avro_path = str(data_dir / "tier3-avro" / "events.avro")
 
@@ -74,7 +85,7 @@ def connect(
         CREATE OR REPLACE VIEW s3_baseline AS
         WITH unnested AS (
             SELECT unnest(Records) AS record
-            FROM read_json('{s3_glob}', columns={{'Records': 'JSON[]'}})
+            FROM read_json({s3_glob_list}, columns={{'Records': 'JSON[]'}})
         )
         SELECT
             json_extract_string(record, '$.eventName') AS eventName,
