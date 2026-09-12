@@ -49,15 +49,30 @@ def connect(
     # -- CloudTrail's per-event-type field variability makes DuckDB's struct
     # unification either explode or fail outright across a real day of mixed
     # events. json_extract_string pulls out only the fields we need.
+    #
+    # The unnest happens in its own CTE, separate from the projection that
+    # extracts eventName/etc. A single `SELECT json_extract_string(r, ...)
+    # FROM read_json(...), unnest(Records) AS t(r)` measured fine unfiltered,
+    # but adding a WHERE on the extracted column made DuckDB plan it as a
+    # LEFT_DELIM_JOIN (a correlated/lateral-join strategy) that re-executes
+    # READ_JSON's remote S3 scan repeatedly -- a query.sql filtered query
+    # went from ~9s to ~85-92s from this alone (see LEARNINGS.md). Forcing
+    # the unnest to fully materialize in its own CTE before any filter can
+    # reference the unnested value keeps every s3_baseline query as a flat
+    # scan regardless of what's filtered downstream.
     con.execute(f"""
         CREATE OR REPLACE VIEW s3_baseline AS
+        WITH unnested AS (
+            SELECT unnest(Records) AS record
+            FROM read_json('{s3_glob}', columns={{'Records': 'JSON[]'}})
+        )
         SELECT
-            json_extract_string(r, '$.eventName') AS eventName,
-            json_extract_string(r, '$.eventSource') AS eventSource,
-            json_extract_string(r, '$.eventTime') AS eventTime,
-            json_extract_string(r, '$.eventID') AS eventID,
-            r AS record
-        FROM read_json('{s3_glob}', columns={{'Records': 'JSON[]'}}), unnest(Records) AS t(r)
+            json_extract_string(record, '$.eventName') AS eventName,
+            json_extract_string(record, '$.eventSource') AS eventSource,
+            json_extract_string(record, '$.eventTime') AS eventTime,
+            json_extract_string(record, '$.eventID') AS eventID,
+            record
+        FROM unnested
     """)
 
     con.execute(f"""

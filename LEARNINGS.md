@@ -105,6 +105,66 @@ local disk sinks, DuckDB comparisons.
    Phase 0 (manifest + reconciliation): point `s3_prefix` at a closed prior
    day for any run where result stability matters.
 
+## Query diversity: the original four queries didn't exercise Avro vs Parquet at all
+
+All four original queries (`top_event_names`, `count_by_source`, `time_range`,
+`cohort_signature`) were structurally identical: full-table scan, one narrow
+aggregate column, no `WHERE`, no nesting. That's exactly the shape neither
+format's real advantages or disadvantages show up in.
+`docs/review-telemetry-plan.md`'s own storage-layout-benchmark guidance calls
+out "projection, selectivity" as required dimensions -- neither was varied
+at all. Added six queries, each isolating one dimension, plus a `-- views:
+v1,v2` directive in `queries.sql` (parsed by `query_bench.py`) for the ones
+that need a column `s3_baseline` doesn't expose:
+
+- `count_only` -- zero-column projection floor (does a columnar reader answer
+  from file metadata alone?).
+- `filtered_low_selectivity` / `filtered_high_selectivity` -- `WHERE
+  eventName = ...` at ~64% and ~0.3% match rates, to see whether Parquet's
+  row-group statistics let it skip work that Avro (no comparable indexing)
+  can't.
+- `nested_identity_breakdown` (`tier2_parquet`,`tier3_avro` only) --
+  `userIdentity.type`, testing nested-struct-field pruning.
+- `boolean_breakdown` (`tier2_parquet`,`tier3_avro` only) -- a low-cardinality
+  boolean column, the case Parquet's dictionary/RLE encoding specifically
+  targets.
+- `full_row_materialize` (`tier2_parquet`,`tier3_avro` only) -- the opposite
+  extreme from `count_only`: touches every column, forcing full-row
+  reconstruction, where a row-oriented format should be most competitive.
+
+10. **Adding the filtered queries surfaced a real, unrelated bug: a DuckDB
+    query-planning pathology in our own `s3_baseline` view, not an
+    Avro/Parquet property.** `filtered_low_selectivity`/
+    `filtered_high_selectivity` against `s3_baseline` took **83-92 seconds**
+    median -- 9-10x slower than every unfiltered query against the same
+    view (~7-11s), while the identical filters against `tier2_parquet`/
+    `tier3_avro` were as fast as or faster than unfiltered. `EXPLAIN` showed
+    DuckDB planning the filtered query as a `LEFT_DELIM_JOIN` (a
+    correlated/lateral-join strategy), apparently re-executing `READ_JSON`'s
+    remote S3 scan repeatedly instead of once. Root cause: `compare/db.py`'s
+    `s3_baseline` view did the `unnest(Records)` and the
+    `json_extract_string(...)` projection in one `SELECT ... FROM
+    read_json(...), unnest(Records) AS t(r)`; a `WHERE` filter on the
+    extracted column made DuckDB treat the unnest as correlated with the
+    filter. Fixed by moving the unnest into its own CTE so nothing
+    downstream can be planned as correlated with it. Verified with
+    `EXPLAIN` (flat `READ_JSON -> UNNEST -> PROJECTION -> FILTER`, no
+    delim-join) and by timing (83-92s -> ~7-9s, in line with the unfiltered
+    baseline).
+
+11. **`full_row_materialize`'s character-count check differed between tiers
+    (1,842,492 vs 1,787,809 for the same 1,507 rows) even though every
+    other check (count, `cohort_signature`'s event-ID fingerprint) agreed.**
+    Not cohort drift -- likely the Go poller preserving the original
+    `requestParameters`/etc. JSON bytes verbatim (`avroenc.FromJSON` keeps
+    `json.RawMessage` as-is) while the Python Beam path re-serializes the
+    same logical JSON via `json.dumps()`, which can differ in whitespace/key
+    order for byte length even when the parsed content is identical. Not
+    fixed -- flagged as a real, small, previously-invisible divergence
+    between the two language implementations' handling of the JSON-string
+    escape-hatch columns, worth checking before trusting any exact
+    byte-for-byte claim about those columns specifically.
+
 ## Comparison results
 
 Real numbers from a batch of CloudTrail records pulled from live delivery

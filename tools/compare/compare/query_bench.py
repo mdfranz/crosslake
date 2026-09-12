@@ -28,11 +28,30 @@ DEFAULT_REPEATS = 5
 DEFAULT_SEED = 1729
 
 
-def load_queries(path: Path = QUERIES_PATH) -> dict[str, str]:
-    """Parses `-- name: <name>` blocks out of queries.sql."""
+VIEWS_DIRECTIVE_RE = re.compile(r"^-- views:\s*(\S+)\s*$", re.MULTILINE)
+
+
+def load_queries(path: Path = QUERIES_PATH) -> dict[str, dict]:
+    """Parses `-- name: <name>` blocks out of queries.sql.
+
+    A block may start with an optional `-- views: v1,v2` directive line to
+    restrict which views it runs against -- needed for anything touching a
+    column s3_baseline doesn't expose (userIdentity, readOnly, ...), since
+    that view only normalizes eventName/eventSource/eventTime (see
+    compare/db.py). Defaults to all of VIEWS when absent.
+    """
     text = path.read_text()
     blocks = re.split(r"^-- name: (\w+)\s*$", text, flags=re.MULTILINE)[1:]
-    return {name: sql.strip().rstrip(";") for name, sql in zip(blocks[0::2], blocks[1::2])}
+    queries = {}
+    for name, body in zip(blocks[0::2], blocks[1::2]):
+        body = body.strip()
+        views = VIEWS
+        m = VIEWS_DIRECTIVE_RE.match(body)
+        if m:
+            views = m.group(1).split(",")
+            body = body[m.end():].strip()
+        queries[name] = {"sql": body.rstrip(";"), "views": views}
+    return queries
 
 
 def _json_default(value):
@@ -73,9 +92,9 @@ def run(
     con = connect(data_dir, poller_config_path)
     queries = load_queries()
     workload = [
-        (name, view, sql_template.format(view=view))
-        for name, sql_template in queries.items()
-        for view in VIEWS
+        (name, view, spec["sql"].format(view=view))
+        for name, spec in queries.items()
+        for view in spec["views"]
     ]
 
     # Warm every query/view pair before measurement. This intentionally
@@ -105,8 +124,8 @@ def run(
             row_counts[(name, view)].add(len(rows))
 
     results = []
-    for name in queries:
-        for view in VIEWS:
+    for name, spec in queries.items():
+        for view in spec["views"]:
             elapsed = observations[(name, view)]
             result_hashes = digests[(name, view)]
             counts = row_counts[(name, view)]
@@ -133,8 +152,16 @@ def run(
         for name in queries
     }
     for result in results:
-        hashes = by_query[result["query"]]
-        result["views_match"] = None not in hashes and len(hashes) == 1
+        views_for_query = queries[result["query"]]["views"]
+        if len(views_for_query) < 2:
+            # Nothing to cross-check -- this query is intentionally scoped
+            # to one view (e.g. it needs a column s3_baseline doesn't
+            # expose). True here would misleadingly imply agreement was
+            # verified across formats.
+            result["views_match"] = None
+        else:
+            hashes = by_query[result["query"]]
+            result["views_match"] = None not in hashes and len(hashes) == 1
     return results
 
 

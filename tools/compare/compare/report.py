@@ -119,9 +119,10 @@ def render_markdown(report: dict | None = None) -> str:
         "|---|---|---:|---:|---:|---|",
     ]
     for r in bench_result:
+        match_display = "n/a" if r["views_match"] is None else r["views_match"]
         lines.append(
             f"| {r['query']} | {r['view']} | {r['median_ms']:.1f} | "
-            f"{r['p95_ms']:.1f} | {r['repeats']} | {r['views_match']} |"
+            f"{r['p95_ms']:.1f} | {r['repeats']} | {match_display} |"
         )
 
     lines += [
@@ -165,7 +166,12 @@ def main():
             experiment=report["experiment"],
             git_commit=report["git"]["commit"],
             cohort_reconciled=report["cohort"]["reconciled"],
-            query_views_match=all(r["views_match"] for r in report["queries"]),
+            # views_match is None (not False) for queries intentionally
+            # scoped to one view (see query_bench.py) -- exclude those
+            # rather than let all() treat None as a mismatch.
+            query_views_match=all(
+                r["views_match"] for r in report["queries"] if r["views_match"] is not None
+            ),
         )
 
     if not args.no_artifact:
