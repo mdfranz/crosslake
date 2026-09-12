@@ -31,6 +31,16 @@ Loop mode is blocked by default. `make poll-loop` explicitly acknowledges the
 known unsafe cursor and exists only for controlled experiments; do not use it
 for completeness-sensitive ingestion.
 
+For a closed-prefix backfill, override the prefix and cursor together so the
+experiment cannot move the configured cursor:
+
+```sh
+cd tools/poller
+go run ./cmd/poller --mode=local --once \
+  --s3-prefix 'AWSLogs/<account-id>/CloudTrail/us-east-1/YYYY/MM/DD/' \
+  --cursor-file './cursor-YYYY-MM-DD.json'
+```
+
 Sanity-check Tier 3 directly:
 
 ```sh

@@ -74,11 +74,8 @@ func main() {
 	if cfg.Mode != "local" {
 		log.Fatalf("mode %q not implemented yet -- this build is Local Mode only (see PLAN.md)", cfg.Mode)
 	}
-	if *s3Prefix != "" {
-		cfg.AWS.S3Prefix = *s3Prefix
-	}
-	if *cursorFile != "" {
-		cfg.CursorFile = *cursorFile
+	if err := applySourceOverrides(&cfg, *s3Prefix, *cursorFile); err != nil {
+		log.Fatal(err)
 	}
 	if !*once && !*allowUnsafePolling {
 		log.Fatal(
@@ -128,6 +125,19 @@ func main() {
 		case <-ticker.C:
 		}
 	}
+}
+
+func applySourceOverrides(cfg *Config, s3Prefix, cursorFile string) error {
+	if s3Prefix != "" && cursorFile == "" {
+		return fmt.Errorf("--s3-prefix requires --cursor-file so a backfill cannot reuse the configured live cursor")
+	}
+	if s3Prefix != "" {
+		cfg.AWS.S3Prefix = s3Prefix
+	}
+	if cursorFile != "" {
+		cfg.CursorFile = cursorFile
+	}
+	return nil
 }
 
 // runOnce is the poll->fetch->parse->write->cursor-update pass described in
