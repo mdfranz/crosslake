@@ -9,8 +9,10 @@
 package avroenc
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -105,6 +107,27 @@ func FromJSON(raw []byte) (*Record, error) {
 		return nil, fmt.Errorf("avroenc: unmarshal record: %w", err)
 	}
 
+	requestParametersJSON, err := canonicalJSONPtr(rr.RequestParameters)
+	if err != nil {
+		return nil, fmt.Errorf("avroenc: requestParameters: %w", err)
+	}
+	responseElementsJSON, err := canonicalJSONPtr(rr.ResponseElements)
+	if err != nil {
+		return nil, fmt.Errorf("avroenc: responseElements: %w", err)
+	}
+	additionalEventDataJSON, err := canonicalJSONPtr(rr.AdditionalEventData)
+	if err != nil {
+		return nil, fmt.Errorf("avroenc: additionalEventData: %w", err)
+	}
+	resourcesJSON, err := canonicalJSONPtr(rr.Resources)
+	if err != nil {
+		return nil, fmt.Errorf("avroenc: resources: %w", err)
+	}
+	serviceEventDetailsJSON, err := canonicalJSONPtr(rr.ServiceEventDetails)
+	if err != nil {
+		return nil, fmt.Errorf("avroenc: serviceEventDetails: %w", err)
+	}
+
 	rec := &Record{
 		EventVersion:            strPtr(rr.EventVersion),
 		EventSource:             strPtr(rr.EventSource),
@@ -120,11 +143,11 @@ func FromJSON(raw []byte) (*Record, error) {
 		RecipientAccountID:      strPtr(rr.RecipientAccountID),
 		ReadOnly:                rr.ReadOnly,
 		ManagementEvent:         rr.ManagementEvent,
-		RequestParametersJSON:   rawJSONPtr(rr.RequestParameters),
-		ResponseElementsJSON:    rawJSONPtr(rr.ResponseElements),
-		AdditionalEventDataJSON: rawJSONPtr(rr.AdditionalEventData),
-		ResourcesJSON:           rawJSONPtr(rr.Resources),
-		ServiceEventDetailsJSON: rawJSONPtr(rr.ServiceEventDetails),
+		RequestParametersJSON:   requestParametersJSON,
+		ResponseElementsJSON:    responseElementsJSON,
+		AdditionalEventDataJSON: additionalEventDataJSON,
+		ResourcesJSON:           resourcesJSON,
+		ServiceEventDetailsJSON: serviceEventDetailsJSON,
 	}
 
 	if rr.EventTime != "" {
@@ -140,6 +163,10 @@ func FromJSON(raw []byte) (*Record, error) {
 		if err := json.Unmarshal(rr.UserIdentity, &rui); err != nil {
 			return nil, fmt.Errorf("avroenc: unmarshal userIdentity: %w", err)
 		}
+		sessionContextJSON, err := canonicalJSONPtr(rui.SessionContext)
+		if err != nil {
+			return nil, fmt.Errorf("avroenc: userIdentity.sessionContext: %w", err)
+		}
 		rec.UserIdentity = &UserIdentity{
 			Type:               strPtr(rui.Type),
 			PrincipalID:        strPtr(rui.PrincipalID),
@@ -148,7 +175,7 @@ func FromJSON(raw []byte) (*Record, error) {
 			AccessKeyID:        strPtr(rui.AccessKeyID),
 			UserName:           strPtr(rui.UserName),
 			InvokedBy:          strPtr(rui.InvokedBy),
-			SessionContextJSON: rawJSONPtr(rui.SessionContext),
+			SessionContextJSON: sessionContextJSON,
 		}
 	}
 
@@ -162,10 +189,35 @@ func strPtr(s string) *string {
 	return &s
 }
 
-func rawJSONPtr(raw json.RawMessage) *string {
+// canonicalJSONPtr re-serializes raw into a canonical form (sorted object
+// keys, compact separators, no HTML-escaping) instead of preserving the
+// source's original byte-for-byte formatting. Without this, the
+// escape-hatch JSON-string columns end up with different content between
+// this Go path and the Python Beam pipeline's equivalent
+// json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False) --
+// a real, measured divergence (see LEARNINGS.md: full_row_materialize's
+// character-count check differed by ~55,000 chars across tiers for
+// otherwise-identical rows) even though both sides parse the same source
+// JSON with the same logical content.
+func canonicalJSONPtr(raw json.RawMessage) (*string, error) {
 	if len(raw) == 0 || string(raw) == "null" {
-		return nil
+		return nil, nil
 	}
-	s := string(raw)
-	return &s
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil, fmt.Errorf("canonicalizing JSON: %w", err)
+	}
+	// json.Marshal sorts map[string]any keys alphabetically already; the
+	// Encoder is used only to get SetEscapeHTML(false), matching Python's
+	// ensure_ascii=False -- plain json.Marshal always HTML-escapes
+	// '<','>','&' regardless of ensure_ascii/HTML concerns, which
+	// json.dumps does not.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, fmt.Errorf("canonicalizing JSON: %w", err)
+	}
+	s := strings.TrimRight(buf.String(), "\n")
+	return &s, nil
 }

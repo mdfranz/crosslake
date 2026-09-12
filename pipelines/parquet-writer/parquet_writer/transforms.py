@@ -28,9 +28,17 @@ def _parse_time(s):
 
 
 def _json_or_none(value):
+    """Canonical JSON: sorted keys, compact separators, real UTF-8 instead
+    of \\uXXXX escapes. Without this, the escape-hatch JSON-string columns
+    end up with different content than the Go poller's equivalent
+    canonicalJSONPtr (tools/poller/internal/avroenc/record.go), which
+    re-serializes with Go's default map-key sorting and SetEscapeHTML(false)
+    -- a real, measured divergence (see LEARNINGS.md) even though both
+    sides parse the same source JSON with the same logical content.
+    """
     if value is None:
         return None
-    return json.dumps(value)
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 class ParseCloudTrailJson(beam.DoFn):

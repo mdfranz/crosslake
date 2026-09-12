@@ -155,15 +155,28 @@ that need a column `s3_baseline` doesn't expose:
 11. **`full_row_materialize`'s character-count check differed between tiers
     (1,842,492 vs 1,787,809 for the same 1,507 rows) even though every
     other check (count, `cohort_signature`'s event-ID fingerprint) agreed.**
-    Not cohort drift -- likely the Go poller preserving the original
-    `requestParameters`/etc. JSON bytes verbatim (`avroenc.FromJSON` keeps
-    `json.RawMessage` as-is) while the Python Beam path re-serializes the
-    same logical JSON via `json.dumps()`, which can differ in whitespace/key
-    order for byte length even when the parsed content is identical. Not
-    fixed -- flagged as a real, small, previously-invisible divergence
-    between the two language implementations' handling of the JSON-string
-    escape-hatch columns, worth checking before trusting any exact
-    byte-for-byte claim about those columns specifically.
+    Not cohort drift -- the Go poller preserved the original
+    `requestParameters`/etc. JSON bytes verbatim (`json.RawMessage` as-is)
+    while the Python Beam path re-serialized the same logical JSON via
+    plain `json.dumps()`, which differs from Go's default map-key
+    ordering/escaping for byte length even when the parsed content is
+    identical. **Fixed**: both sides now canonicalize before storing --
+    sorted keys, compact separators, no HTML-escaping, real UTF-8 instead
+    of `\uXXXX` escapes. Go: `canonicalJSONPtr` in
+    `tools/poller/internal/avroenc/record.go` (unmarshal to `any`, re-marshal
+    via an `Encoder` with `SetEscapeHTML(false)` -- plain `json.Marshal`
+    always HTML-escapes `<>&` regardless of any other setting). Python:
+    `json.dumps(value, sort_keys=True, separators=(",", ":"),
+    ensure_ascii=False)` in `parquet_writer/transforms.py`. Verified: a
+    fresh run now produces byte-identical strings (confirmed on a sample
+    `requestParametersJson` value) and `full_row_materialize`'s
+    `total_chars` matches exactly (1,795,587 both sides) with the same
+    result hash. Regression-tested in
+    `tools/poller/internal/avroenc/record_test.go` (out-of-order keys,
+    `&`, and a non-ASCII character all round-trip to the expected
+    canonical form). No equivalent Python test added -- this project has
+    no pytest setup yet, and adding one is a bigger scope decision than
+    this fix; live verification above stands in for it.
 
 ## Comparison results
 
