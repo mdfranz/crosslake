@@ -8,6 +8,7 @@ tools/poller/bin/
 tools/poller/poller
 tools/poller/cursor.json
 *.cursor.json
+tools/poller/cursor-*.json
 
 # Python
 __pycache__/
