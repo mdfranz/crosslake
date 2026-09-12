@@ -1,0 +1,43 @@
+# Local data directories & test outputs
+data/
+*.duckdb
+*.duckdb.tmp
+
+# Go
+tools/poller/bin/
+tools/poller/poller
+tools/poller/cursor.json
+*.cursor.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Node / Pulumi
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pulumi/
+
+# Local configs and secrets
+*config.yaml
+!config.example.yaml
+*.env
+*.pem
+*.key
+
+# OS & Editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
