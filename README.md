@@ -2,7 +2,8 @@
 
 A hands-on comparison of Avro vs. Parquet for streaming CloudTrail logs
 through a real pipeline: AWS S3 -> (GCP Pub/Sub ->) GCS/local disk. See
-`PLAN.md` for the full design and `LEARNINGS.md` for results.
+`PLAN.md` for the full design, `LEARNINGS.md` for results, and `ISSUES.md`
+for concrete open gaps.
 
 **Current scope: Local Mode only.** No GCP infrastructure is provisioned or
 required. The Go poller reads real CloudTrail logs from S3 and writes to
