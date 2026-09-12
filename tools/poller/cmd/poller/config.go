@@ -23,7 +23,13 @@ type Config struct {
 		DataDir string `yaml:"data_dir"`
 	} `yaml:"local"`
 
-	CursorFile          string `yaml:"cursor_file"`
+	// CursorFile is the legacy last-key progress marker, used only by the
+	// --allow-unsafe-last-key-polling loop path. The supported --once path
+	// uses LedgerFile instead -- see internal/ledger and checkpoint.go.
+	CursorFile string `yaml:"cursor_file"`
+	// LedgerFile persists the seen-object set (bucket, key, etag) that the
+	// --once path diffs a fresh S3 listing against every run.
+	LedgerFile          string `yaml:"ledger_file"`
 	PollIntervalSeconds int    `yaml:"poll_interval_seconds"`
 
 	// CheckpointEveryObjects batches the flush+cursor-checkpoint that
@@ -76,6 +82,9 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if cfg.CursorFile == "" {
 		cfg.CursorFile = "./cursor.json"
+	}
+	if cfg.LedgerFile == "" {
+		cfg.LedgerFile = "./ledger.json"
 	}
 	if cfg.PollIntervalSeconds <= 0 {
 		cfg.PollIntervalSeconds = 60

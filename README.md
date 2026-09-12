@@ -2,7 +2,8 @@
 
 A hands-on comparison of Avro vs. Parquet for streaming CloudTrail logs
 through a real pipeline: AWS S3 -> (GCP Pub/Sub ->) GCS/local disk. See
-`PLAN.md` for the full design and `LEARNINGS.md` for results.
+`PLAN.md` for the full design, `LEARNINGS.md` for results, and `ISSUES.md`
+for concrete open gaps.
 
 **Current scope: Local Mode only.** No GCP infrastructure is provisioned or
 required. The Go poller reads real CloudTrail logs from S3 and writes to
@@ -28,15 +29,17 @@ uvx logfire --region=us projects use --org <your-org> <your-project>
 cp tools/poller/config.example.yaml tools/poller/config.yaml
 $EDITOR tools/poller/config.yaml
 
-make poll-once        # use a closed day prefix; see the cursor warning below
+make poll-once        # use a closed day prefix; see the ledger/cursor note below
 make beam-local       # ./data/raw.jsonl -> ./data/tier2-parquet/ (Parquet)
 make compare-report   # Markdown + JSON evidence under ./data/reports/
 ```
 
 `./data/` is gitignored; nothing it contains is ever committed.
-The current last-key cursor is unsafe for continuous CloudTrail delivery, so
-loop mode requires an explicit opt-in. It is retained only for controlled
-experiments while a seen-object ledger is designed.
+`--once` is backed by a seen-object ledger (`internal/ledger`) keyed by
+`(bucket, key, etag)`, safe to rerun against a closed prefix. Continuous loop
+mode still uses the legacy last-key cursor, which is unsafe for continuous
+CloudTrail delivery (see `LEARNINGS.md`), so it requires an explicit opt-in
+and is retained only for controlled experiments.
 
 ## Layout
 

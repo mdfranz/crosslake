@@ -179,13 +179,37 @@ Questions the telemetry should answer directly:
 
 ### Phase 0 — make Local Mode trustworthy
 
-- Add the object ledger and closed-prefix safety checks.
-- Land immutable raw inputs and a run/cohort manifest.
-- Reconcile object and record counts before reporting.
-- Add synthetic contract tests and crash/retry tests.
+- [x] Add the object ledger and closed-prefix safety checks. Landed on
+      `ledger-and-manifest`: `internal/ledger`, `s3source.Source.List`
+      (full listing, no `StartAfter`), `--once`'s `ledgerCheckpointer`,
+      and read-only `--reconcile`. See `LEARNINGS.md` #20.
+- [x] Land immutable raw inputs and a run/cohort manifest. Landed:
+      `internal/manifest` writes `run_id`/`cohort_id`/`git_commit`/
+      `schema_version`/`object_count`/`total_bytes`/`total_records`/
+      `objects_fingerprint` after every `--once`; `compare/manifest.py`
+      reads it (`manifest_files:` config key for a multi-prefix cohort,
+      mirroring `aws.s3_prefixes`). "Immutable raw inputs" is still
+      `raw.jsonl` being append-only plus the ledger's dedup, not a
+      separate immutable-storage mechanism. See `LEARNINGS.md` #22.
+- [x] Reconcile object and record counts before reporting. `--reconcile`
+      covers object-level gaps for one prefix (read-only, pre-ingest).
+      `compare/manifest.py` (wired into `report.py`'s fail-closed gate)
+      covers record-level counts across `s3_baseline`/`tier2_parquet`/
+      `tier3_avro` against the durable manifest, at report time -- and
+      caught a real duplicate-record bug doing it (`LEARNINGS.md` #22).
+- [x]/[ ] Add synthetic contract tests and crash/retry tests. Crash/retry:
+      done for the ledger (`TestRunOnceLedgerCrashRetryReprocessesOnlyUnflushedChunk`).
+      Synthetic schema-variant contract tests (the P1 "schema conclusions
+      are premature" finding): not started.
 
-Exit: rerunning or crashing at every checkpoint produces no missing records;
-all tier fingerprints match for a fixed cohort.
+Exit: rerunning or crashing at every checkpoint produces no missing records
+(true for the ledger's own bookkeeping now; not yet proven end-to-end
+against the raw/Avro pair together, which item 4 in `LEARNINGS.md` notes
+still isn't transactional); all tier fingerprints match for a fixed cohort
+-- true as of `LEARNINGS.md` #22's clean 2-day cohort (manifest totals and
+every tier's live count agree), verified against real S3/local data,
+including a real mismatch the check correctly caught and failed closed on
+before that clean run.
 
 ### Phase 1 — build the experiment harness
 
