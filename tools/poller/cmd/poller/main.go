@@ -32,7 +32,19 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// main only ever calls os.Exit, and only with run's result -- run itself
+// must never call log.Fatal/os.Exit. Exiting from inside run (as an earlier
+// version of this function did, via log.Fatal after telemetry.Init) skips
+// every deferred function on that stack, including the shutdown() that
+// flushes buffered OTEL spans -- confirmed for real while testing --
+// reconcile's error path: the span for a deliberately-triggered "objects
+// missing" failure never reached Logfire at all, while the success-path
+// span for the same command landed fine. See LEARNINGS.md.
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	configPath := flag.String("config", "config.yaml", "path to poller config YAML")
 	schemaPath := flag.String("schema", "schema/cloudtrail.avsc", "path to the Avro schema")
 	mode := flag.String("mode", "", "sink mode override: local|pubsub (default: from config)")
@@ -56,9 +68,22 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// fail logs and returns the exit code run() should propagate to main's
+	// os.Exit -- never call log.Fatal*/os.Exit directly below this point,
+	// or every defer registered so far (most importantly shutdown, just
+	// below) gets skipped. See run's doc comment.
+	fail := func(format string, args ...any) int {
+		log.Printf(format, args...)
+		return 1
+	}
+
 	shutdown, err := telemetry.Init(ctx, "crosslake-poller")
 	if err != nil {
-		log.Fatalf("telemetry init: %v", err)
+		// Nothing to flush yet -- telemetry itself failed to initialize --
+		// so this one case is safe as a direct return without fail's
+		// logging wrapper adding anything.
+		log.Printf("telemetry init: %v", err)
+		return 1
 	}
 	defer func() {
 		// Use a fresh context: ctx may already be canceled (Ctrl+C) by the
@@ -72,7 +97,7 @@ func main() {
 
 	cfg, err := LoadConfig(*configPath)
 	if err != nil {
-		log.Fatal(err)
+		return fail("%v", err)
 	}
 	if *mode != "" {
 		cfg.Mode = *mode
@@ -81,20 +106,20 @@ func main() {
 		cfg.Mode = "local"
 	}
 	if cfg.Mode != "local" {
-		log.Fatalf("mode %q not implemented yet -- this build is Local Mode only (see PLAN.md)", cfg.Mode)
+		return fail("mode %q not implemented yet -- this build is Local Mode only (see PLAN.md)", cfg.Mode)
 	}
 	// The cursor is only ever consulted by loop mode (--once and
 	// --reconcile are both ledger-only), so a backfill combined with
 	// either of those doesn't need to override it too.
 	needsCursor := !*once && !*reconcile
 	if err := applySourceOverrides(&cfg, *s3Prefix, *cursorFile, *ledgerFile, needsCursor); err != nil {
-		log.Fatal(err)
+		return fail("%v", err)
 	}
 	if *fetchConcurrency > 0 {
 		cfg.FetchConcurrency = *fetchConcurrency
 	}
 	if !*once && !*reconcile && !*allowUnsafePolling {
-		log.Fatal(
+		return fail(
 			"loop mode disabled: the last-key cursor can omit out-of-order CloudTrail deliveries; " +
 				"use --once (backed by the ledger, safe for a closed prefix) or explicitly acknowledge " +
 				"the risk with --allow-unsafe-last-key-polling",
@@ -103,37 +128,37 @@ func main() {
 
 	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(cfg.AWS.Region))
 	if err != nil {
-		log.Fatalf("loading AWS config: %v", err)
+		return fail("loading AWS config: %v", err)
 	}
 	src := s3source.New(s3.NewFromConfig(awsCfg), cfg.AWS.S3Bucket, cfg.AWS.S3Prefix)
 
 	if *reconcile {
 		if err := runReconcile(ctx, src, cfg); err != nil {
-			log.Fatal(err)
+			return fail("%v", err)
 		}
-		return
+		return 0
 	}
 
 	schemaBytes, err := os.ReadFile(*schemaPath)
 	if err != nil {
-		log.Fatalf("reading schema %s: %v", *schemaPath, err)
+		return fail("reading schema %s: %v", *schemaPath, err)
 	}
 	schema, err := avro.Parse(string(schemaBytes))
 	if err != nil {
-		log.Fatalf("parsing schema %s: %v", *schemaPath, err)
+		return fail("parsing schema %s: %v", *schemaPath, err)
 	}
 
 	if *once {
 		cp, err := newLedgerCheckpointer(cfg.LedgerFile, cfg.AWS.S3Bucket, src)
 		if err != nil {
-			log.Fatalf("loading ledger %s: %v", cfg.LedgerFile, err)
+			return fail("loading ledger %s: %v", cfg.LedgerFile, err)
 		}
 		n, err := runOnce(ctx, src, cp, schema, cfg)
 		if err != nil {
-			log.Fatalf("poll failed: %v", err)
+			return fail("poll failed: %v", err)
 		}
 		log.Printf("done: %d record(s) written to %s", n, cfg.Local.DataDir)
-		return
+		return 0
 	}
 
 	log.Printf("polling every %ds (Ctrl+C to stop)", cfg.PollIntervalSeconds)
@@ -146,7 +171,7 @@ func main() {
 		// already persisted that via cursor.Save.
 		cp, err := newCursorCheckpointer(cfg.CursorFile, src)
 		if err != nil {
-			log.Fatalf("loading cursor %s: %v", cfg.CursorFile, err)
+			return fail("loading cursor %s: %v", cfg.CursorFile, err)
 		}
 		n, err := runOnce(ctx, src, cp, schema, cfg)
 		if err != nil {
@@ -156,7 +181,7 @@ func main() {
 		}
 		select {
 		case <-ctx.Done():
-			return
+			return 0
 		case <-ticker.C:
 		}
 	}
@@ -191,20 +216,44 @@ func applySourceOverrides(cfg *Config, s3Prefix, cursorFile, ledgerFile string, 
 // what that gap means (unprocessed work, or a late delivery that arrived
 // after an earlier run already advanced past it). Read-only: it never
 // fetches object bodies or touches the sink or the ledger file.
-func runReconcile(ctx context.Context, src *s3source.Source, cfg Config) error {
+//
+// Named return so the deferred status-setting below covers every return
+// path, matching runOnce's "poll" span -- see its doc comment for why a
+// categorized status string, not err.Error(), is exported (wrapped errors
+// here can carry an S3 key).
+func runReconcile(ctx context.Context, src *s3source.Source, cfg Config) (err error) {
+	tracer := otel.Tracer("crosslake-poller")
+	ctx, span := tracer.Start(ctx, "reconcile")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.SetStatus(codes.Error, "reconcile_failed")
+		}
+	}()
+	started := time.Now()
+	defer func() {
+		span.SetAttributes(attribute.Int64("reconcile.duration_ms", time.Since(started).Milliseconds()))
+	}()
+
 	l, err := ledger.Load(cfg.LedgerFile)
 	if err != nil {
+		span.SetStatus(codes.Error, "ledger_load_failed")
 		return fmt.Errorf("reconcile: loading ledger %s: %w", cfg.LedgerFile, err)
 	}
 	objects, err := src.List(ctx)
 	if err != nil {
+		span.SetStatus(codes.Error, "list_failed")
 		return fmt.Errorf("reconcile: listing: %w", err)
 	}
+	span.SetAttributes(attribute.Int("s3.objects_found", len(objects)))
+
 	keyETags := make([]ledger.KeyETag, len(objects))
 	for i, o := range objects {
 		keyETags[i] = ledger.KeyETag{Key: o.Key, ETag: o.ETag}
 	}
 	missing := l.Missing(cfg.AWS.S3Bucket, keyETags)
+	span.SetAttributes(attribute.Int("reconcile.missing_count", len(missing)))
+
 	if len(missing) == 0 {
 		log.Printf("reconcile: %d object(s) in S3, all present in ledger %s", len(objects), cfg.LedgerFile)
 		return nil
@@ -213,6 +262,7 @@ func runReconcile(ctx context.Context, src *s3source.Source, cfg Config) error {
 	for _, m := range missing {
 		log.Printf("  missing: %s (etag=%s)", m.Key, m.ETag)
 	}
+	span.SetStatus(codes.Error, "objects_missing")
 	return fmt.Errorf("reconcile: %d object(s) missing from the ledger -- rerun --once to process them", len(missing))
 }
 

@@ -492,6 +492,22 @@ numbers will vary with whatever's currently polled into `./data/`.
     yet at poll time" problem, which needs event notifications plus a
     reconciliation cadence (`PLAN.md` "Explicit future work").
 
+21. **`log.Fatal`/`log.Fatalf` after `telemetry.Init` silently dropped
+    every error-path span, program-wide.** `os.Exit` (which every
+    `log.Fatal*` call ends in) skips all deferred functions on the stack,
+    including `main`'s `defer shutdown(sctx)` -- so any failure after
+    telemetry initialized (poll failure, reconcile failure, bad config,
+    etc.) exited before its own span was ever flushed to Logfire. Caught
+    live while verifying the new `--reconcile` span (item 20): a
+    deliberately-triggered "objects missing" failure produced no span at
+    all in Logfire, while the success-path run for the same command landed
+    fine. Fixed by restructuring `main` into a thin `os.Exit(run())`
+    wrapper plus `run() int`, which returns an exit code instead of ever
+    calling `log.Fatal*`/`os.Exit` itself -- `run`'s own defers (including
+    `shutdown`) now always execute before the process exits. Re-verified
+    the exact failing case: the `reconcile` span for the same
+    "882 missing" scenario now lands with `otel_status_code: ERROR`.
+
 ## Open questions / next experiments
 
 - Re-run at a larger batch size (multiple days) to see whether the
