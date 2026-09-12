@@ -12,6 +12,7 @@ flush -- see PLAN.md ("Risks / gotchas").
 """
 
 import argparse
+import glob
 import logging
 
 import apache_beam as beam
@@ -23,6 +24,39 @@ from apache_beam.options.pipeline_options import PipelineOptions
 from parquet_writer import telemetry
 from parquet_writer.cloudtrail_schema import CLOUDTRAIL_SCHEMA
 from parquet_writer.transforms import METRIC_NAMESPACE, REJECTS_TAG, ParseCloudTrailJson
+
+
+def _sample_rejects(output_prefix: str, limit: int = 3) -> list[str]:
+    """Reads up to `limit` exception *type names* (nothing else) out of the
+    local _rejects output file(s), as a same-shape check on whether
+    rejects share one cause or come from several.
+
+    Beam's per-element counters tell you *how many* records were rejected
+    but never *why* -- that detail only ever reached the local text file,
+    invisible from Logfire entirely (no exception, no sample, nothing on
+    the Issues page). This is a bounded, one-time read at the driver after
+    the run finishes, not a per-element telemetry call, so it can't
+    reintroduce the per-record span/log volume this design deliberately
+    avoids (see transforms.py's docstring).
+
+    Each rejects line is `f"{TypeName}: {message}\\t{raw_line}"` (see
+    transforms.py's process()) -- the message and raw_line can contain
+    real CloudTrail content (account IDs, ARNs, source IPs) and, per
+    docs/observability.md's data-minimization rule ("no raw exception
+    strings"), never leave this process. Only the leading exception type
+    name (purely structural -- "JSONDecodeError", "ValueError", ...) is
+    kept.
+    """
+    types: list[str] = []
+    for path in sorted(glob.glob(output_prefix + "_rejects*")):
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                before_tab, _, _raw_record_discarded = line.rstrip("\n").partition("\t")
+                type_name, _, _message_discarded = before_tab.partition(":")
+                types.append(type_name)
+                if len(types) >= limit:
+                    return types
+    return types
 
 
 def build_pipeline(
@@ -113,7 +147,18 @@ def main():
                     f"{name}_mean": value.mean,
                 }
             )
-        logfire.info("beam pipeline completed", state=str(state), **counters, **distributions)
+        rejected_total = sum(v for k, v in counters.items() if k.startswith("rejected_"))
+        if rejected_total:
+            logfire.warn(
+                "beam pipeline completed with rejected records {rejected_total}",
+                rejected_total=rejected_total,
+                sample_reject_types=_sample_rejects(known_args.output_prefix),
+                state=str(state),
+                **counters,
+                **distributions,
+            )
+        else:
+            logfire.info("beam pipeline completed", state=str(state), **counters, **distributions)
 
     logfire.force_flush()
 

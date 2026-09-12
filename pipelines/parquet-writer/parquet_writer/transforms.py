@@ -28,9 +28,17 @@ def _parse_time(s):
 
 
 def _json_or_none(value):
+    """Canonical JSON: sorted keys, compact separators, real UTF-8 instead
+    of \\uXXXX escapes. Without this, the escape-hatch JSON-string columns
+    end up with different content than the Go poller's equivalent
+    canonicalJSONPtr (tools/poller/internal/avroenc/record.go), which
+    re-serializes with Go's default map-key sorting and SetEscapeHTML(false)
+    -- a real, measured divergence (see LEARNINGS.md) even though both
+    sides parse the same source JSON with the same logical content.
+    """
     if value is None:
         return None
-    return json.dumps(value)
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 class ParseCloudTrailJson(beam.DoFn):
@@ -58,7 +66,11 @@ class ParseCloudTrailJson(beam.DoFn):
         except json.JSONDecodeError as e:
             self._rejected_json.inc()
             self._parse_us.update((time.perf_counter_ns() - started_ns) // 1_000)
-            yield beam.pvalue.TaggedOutput(REJECTS_TAG, (element, f"invalid JSON: {e}"))
+            # Exception type name first: pipeline.py's driver-side summary
+            # samples only this token (safe, purely structural) and never
+            # the message text or raw record that follow -- see its
+            # docstring for why. Full detail stays local for debugging.
+            yield beam.pvalue.TaggedOutput(REJECTS_TAG, (element, f"{type(e).__name__}: invalid JSON: {e}"))
             return
 
         try:
@@ -66,7 +78,7 @@ class ParseCloudTrailJson(beam.DoFn):
         except Exception as e:  # noqa: BLE001 -- one bad record shouldn't kill the pipeline
             self._rejected_parse.inc()
             self._parse_us.update((time.perf_counter_ns() - started_ns) // 1_000)
-            yield beam.pvalue.TaggedOutput(REJECTS_TAG, (element, f"parse error: {e}"))
+            yield beam.pvalue.TaggedOutput(REJECTS_TAG, (element, f"{type(e).__name__}: parse error: {e}"))
             return
 
         self._parsed.inc()

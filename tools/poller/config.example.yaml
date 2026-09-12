@@ -8,11 +8,39 @@ aws:
   region: us-east-1
   s3_bucket: example-cloudtrail-bucket
   # Narrow this to one account/region to keep local runs fast; ListObjectsV2
-  # is paginated but CloudTrail buckets can hold years of history.
+  # is paginated but CloudTrail buckets can hold years of history. This is
+  # the poller's own live-tailing prefix; ingesting other days is done via
+  # `poller --s3-prefix=... --cursor-file=...` (see docs/runbook.md), not by
+  # editing this value.
   s3_prefix: AWSLogs/123456789012/CloudTrail/us-east-1/
+  # Optional, tools/compare only (the Go poller ignores this key): a list
+  # of prefixes whose union is the S3 baseline for compare.*, for when the
+  # local tiers cover more than one prefix -- e.g. after ingesting several
+  # days via --s3-prefix. Overrides s3_prefix above for compare.* only when
+  # present. DuckDB's glob() doesn't support brace expansion (`{10,11}`
+  # matches nothing); this is compare/db.py's workaround.
+  # s3_prefixes:
+  #   - AWSLogs/123456789012/CloudTrail/us-east-1/2026/09/10/
+  #   - AWSLogs/123456789012/CloudTrail/us-east-1/2026/09/11/
 
 local:
   data_dir: ../../data # repo-root ./data -- run poller from tools/poller (see Makefile)
 
 cursor_file: ./cursor.json # tools/poller/cursor.json, gitignored
 poll_interval_seconds: 60
+
+# How many S3 objects to process between flush+cursor-checkpoints. Flushing
+# forces a new Avro OCF compression block, so checkpointing every object (1)
+# was measured to roughly double the Avro file size on a real batch (one
+# ~2.4-record block per object) -- see LEARNINGS.md. Higher values compress
+# better but widen the at-least-once replay window on crash (up to this many
+# objects re-fetched and re-appended next run). Default: 100.
+checkpoint_every_objects: 100
+
+# How many S3 GetObject+gunzip fetches run concurrently within each
+# checkpoint batch. Fetch latency is network-RTT-bound, not CPU-bound, and
+# dominates poll wall-clock time by ~1000x over local parse+write (see
+# LEARNINGS.md) -- measured ~8x real speedup (87.9ms/object -> 11.0ms/object
+# average) at the default vs. sequential (1). Parsing/writing always stays
+# strictly sequential regardless of this value. Default: 16.
+fetch_concurrency: 16

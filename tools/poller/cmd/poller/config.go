@@ -25,6 +25,32 @@ type Config struct {
 
 	CursorFile          string `yaml:"cursor_file"`
 	PollIntervalSeconds int    `yaml:"poll_interval_seconds"`
+
+	// CheckpointEveryObjects batches the flush+cursor-checkpoint that
+	// otherwise runs after every single S3 object. Flushing forces a new
+	// Avro OCF compression block (hamba/avro/v2/ocf's Encoder.Flush), so
+	// checkpointing every object was measured to produce one ~2.4-record
+	// block per object and roughly double the Avro file size on a real
+	// batch (see LEARNINGS.md) versus checkpointing every N objects. This
+	// widens the at-least-once replay window on crash (up to N objects
+	// re-fetched and re-appended -- the sinks were already not exactly-once
+	// at the single-object granularity, so this is the same failure mode at
+	// a larger, tunable grain, not a new one). Set to 1 to restore the
+	// maximally-safe, worst-compression behavior.
+	CheckpointEveryObjects int `yaml:"checkpoint_every_objects"`
+
+	// FetchConcurrency bounds how many S3 GetObject+gunzip fetches run in
+	// flight at once within each checkpoint batch. Telemetry showed
+	// fetch/object latency (~72-88ms avg, network-RTT-bound, not
+	// CPU-bound) as the dominant cost of a poll by ~1000x over local
+	// parse+write time (see LEARNINGS.md) -- sequential fetching means
+	// wall-clock poll time is that latency multiplied by object count.
+	// Fetches within a batch run concurrently up to this bound; parsing
+	// and writing stay strictly sequential in listing order afterward
+	// (disksink.Sink isn't safe for concurrent writes, and the cursor
+	// checkpoint depends on listing order). Set to 1 to restore the
+	// original fully-sequential behavior.
+	FetchConcurrency int `yaml:"fetch_concurrency"`
 }
 
 // LoadConfig reads and validates the YAML config at path.
@@ -53,6 +79,12 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if cfg.PollIntervalSeconds <= 0 {
 		cfg.PollIntervalSeconds = 60
+	}
+	if cfg.CheckpointEveryObjects <= 0 {
+		cfg.CheckpointEveryObjects = 100
+	}
+	if cfg.FetchConcurrency <= 0 {
+		cfg.FetchConcurrency = 16
 	}
 
 	return cfg, nil
