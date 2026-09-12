@@ -9,6 +9,9 @@ tools/poller/poller
 tools/poller/cursor.json
 *.cursor.json
 tools/poller/cursor-*.json
+tools/poller/ledger.json
+*.ledger.json
+tools/poller/ledger-*.json
 
 # Python
 __pycache__/

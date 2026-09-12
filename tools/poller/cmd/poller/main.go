@@ -21,8 +21,8 @@ import (
 	"github.com/hamba/avro/v2"
 
 	"github.com/mdfranz/crosslake/tools/poller/internal/avroenc"
-	"github.com/mdfranz/crosslake/tools/poller/internal/cursor"
 	"github.com/mdfranz/crosslake/tools/poller/internal/disksink"
+	"github.com/mdfranz/crosslake/tools/poller/internal/ledger"
 	"github.com/mdfranz/crosslake/tools/poller/internal/s3source"
 	"github.com/mdfranz/crosslake/tools/poller/internal/telemetry"
 
@@ -37,13 +37,19 @@ func main() {
 	schemaPath := flag.String("schema", "schema/cloudtrail.avsc", "path to the Avro schema")
 	mode := flag.String("mode", "", "sink mode override: local|pubsub (default: from config)")
 	once := flag.Bool("once", false, "run a single poll pass and exit")
-	s3Prefix := flag.String("s3-prefix", "", "S3 prefix override (default: from config) -- for backfilling an earlier date range without touching the live cursor")
-	cursorFile := flag.String("cursor-file", "", "cursor file override (default: from config) -- pair with -s3-prefix so a backfill run doesn't reuse (or clobber) the live tailing cursor")
+	s3Prefix := flag.String("s3-prefix", "", "S3 prefix override (default: from config) -- for backfilling an earlier date range without touching the live cursor/ledger")
+	cursorFile := flag.String("cursor-file", "", "cursor file override (default: from config), used only by --allow-unsafe-last-key-polling loop mode")
+	ledgerFile := flag.String("ledger-file", "", "ledger file override (default: from config) -- pair with -s3-prefix so a backfill doesn't reuse (or grow) the live ledger")
 	fetchConcurrency := flag.Int("fetch-concurrency", 0, "concurrent S3 fetch override (default: from config, normally 16) -- set 1 to restore fully-sequential fetching")
 	allowUnsafePolling := flag.Bool(
 		"allow-unsafe-last-key-polling",
 		false,
-		"allow loop mode despite the known out-of-order CloudTrail delivery gap",
+		"allow loop mode despite the known out-of-order CloudTrail delivery gap (see internal/cursor) -- --once uses the ledger instead and doesn't need this",
+	)
+	reconcile := flag.Bool(
+		"reconcile",
+		false,
+		"read-only: re-list the configured prefix and report any objects missing from the ledger, without processing them; exits non-zero if any are found",
 	)
 	flag.Parse()
 
@@ -77,18 +83,35 @@ func main() {
 	if cfg.Mode != "local" {
 		log.Fatalf("mode %q not implemented yet -- this build is Local Mode only (see PLAN.md)", cfg.Mode)
 	}
-	if err := applySourceOverrides(&cfg, *s3Prefix, *cursorFile); err != nil {
+	// The cursor is only ever consulted by loop mode (--once and
+	// --reconcile are both ledger-only), so a backfill combined with
+	// either of those doesn't need to override it too.
+	needsCursor := !*once && !*reconcile
+	if err := applySourceOverrides(&cfg, *s3Prefix, *cursorFile, *ledgerFile, needsCursor); err != nil {
 		log.Fatal(err)
 	}
 	if *fetchConcurrency > 0 {
 		cfg.FetchConcurrency = *fetchConcurrency
 	}
-	if !*once && !*allowUnsafePolling {
+	if !*once && !*reconcile && !*allowUnsafePolling {
 		log.Fatal(
 			"loop mode disabled: the last-key cursor can omit out-of-order CloudTrail deliveries; " +
-				"use --once with a closed date prefix or explicitly acknowledge the risk with " +
-				"--allow-unsafe-last-key-polling",
+				"use --once (backed by the ledger, safe for a closed prefix) or explicitly acknowledge " +
+				"the risk with --allow-unsafe-last-key-polling",
 		)
+	}
+
+	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(cfg.AWS.Region))
+	if err != nil {
+		log.Fatalf("loading AWS config: %v", err)
+	}
+	src := s3source.New(s3.NewFromConfig(awsCfg), cfg.AWS.S3Bucket, cfg.AWS.S3Prefix)
+
+	if *reconcile {
+		if err := runReconcile(ctx, src, cfg); err != nil {
+			log.Fatal(err)
+		}
+		return
 	}
 
 	schemaBytes, err := os.ReadFile(*schemaPath)
@@ -100,14 +123,12 @@ func main() {
 		log.Fatalf("parsing schema %s: %v", *schemaPath, err)
 	}
 
-	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(cfg.AWS.Region))
-	if err != nil {
-		log.Fatalf("loading AWS config: %v", err)
-	}
-	src := s3source.New(s3.NewFromConfig(awsCfg), cfg.AWS.S3Bucket, cfg.AWS.S3Prefix)
-
 	if *once {
-		n, err := runOnce(ctx, src, schema, cfg)
+		cp, err := newLedgerCheckpointer(cfg.LedgerFile, cfg.AWS.S3Bucket, src)
+		if err != nil {
+			log.Fatalf("loading ledger %s: %v", cfg.LedgerFile, err)
+		}
+		n, err := runOnce(ctx, src, cp, schema, cfg)
 		if err != nil {
 			log.Fatalf("poll failed: %v", err)
 		}
@@ -119,7 +140,15 @@ func main() {
 	ticker := time.NewTicker(time.Duration(cfg.PollIntervalSeconds) * time.Second)
 	defer ticker.Stop()
 	for {
-		n, err := runOnce(ctx, src, schema, cfg)
+		// A fresh cursorCheckpointer per pass is deliberate and cheap (it's
+		// just cursor.Load): the ticker loop's whole reason to exist is
+		// picking up where the last pass's Commit left off, and Commit
+		// already persisted that via cursor.Save.
+		cp, err := newCursorCheckpointer(cfg.CursorFile, src)
+		if err != nil {
+			log.Fatalf("loading cursor %s: %v", cfg.CursorFile, err)
+		}
+		n, err := runOnce(ctx, src, cp, schema, cfg)
 		if err != nil {
 			log.Printf("poll failed: %v", err)
 		} else if n > 0 {
@@ -133,9 +162,17 @@ func main() {
 	}
 }
 
-func applySourceOverrides(cfg *Config, s3Prefix, cursorFile string) error {
-	if s3Prefix != "" && cursorFile == "" {
-		return fmt.Errorf("--s3-prefix requires --cursor-file so a backfill cannot reuse the configured live cursor")
+// applySourceOverrides applies a backfill's --s3-prefix override, requiring
+// a dedicated --ledger-file every time (both --once and --reconcile are
+// ledger-only) and a dedicated --cursor-file only when needsCursor is true
+// (loop mode) -- otherwise a backfill would silently reuse, and permanently
+// grow, the configured live cursor/ledger.
+func applySourceOverrides(cfg *Config, s3Prefix, cursorFile, ledgerFile string, needsCursor bool) error {
+	if s3Prefix != "" && ledgerFile == "" {
+		return fmt.Errorf("--s3-prefix requires --ledger-file so a backfill cannot reuse (or grow) the configured live ledger")
+	}
+	if s3Prefix != "" && needsCursor && cursorFile == "" {
+		return fmt.Errorf("--s3-prefix with loop mode requires --cursor-file so a backfill cannot reuse (or move) the configured live cursor")
 	}
 	if s3Prefix != "" {
 		cfg.AWS.S3Prefix = s3Prefix
@@ -143,11 +180,52 @@ func applySourceOverrides(cfg *Config, s3Prefix, cursorFile string) error {
 	if cursorFile != "" {
 		cfg.CursorFile = cursorFile
 	}
+	if ledgerFile != "" {
+		cfg.LedgerFile = ledgerFile
+	}
 	return nil
 }
 
-// runOnce is the poll->fetch->parse->write->cursor-update pass described in
+// runReconcile re-lists the configured prefix and reports any object S3 has
+// that the ledger doesn't -- see internal/ledger.Missing's doc comment for
+// what that gap means (unprocessed work, or a late delivery that arrived
+// after an earlier run already advanced past it). Read-only: it never
+// fetches object bodies or touches the sink or the ledger file.
+func runReconcile(ctx context.Context, src *s3source.Source, cfg Config) error {
+	l, err := ledger.Load(cfg.LedgerFile)
+	if err != nil {
+		return fmt.Errorf("reconcile: loading ledger %s: %w", cfg.LedgerFile, err)
+	}
+	objects, err := src.List(ctx)
+	if err != nil {
+		return fmt.Errorf("reconcile: listing: %w", err)
+	}
+	keyETags := make([]ledger.KeyETag, len(objects))
+	for i, o := range objects {
+		keyETags[i] = ledger.KeyETag{Key: o.Key, ETag: o.ETag}
+	}
+	missing := l.Missing(cfg.AWS.S3Bucket, keyETags)
+	if len(missing) == 0 {
+		log.Printf("reconcile: %d object(s) in S3, all present in ledger %s", len(objects), cfg.LedgerFile)
+		return nil
+	}
+	log.Printf("reconcile: %d of %d object(s) in S3 are missing from ledger %s", len(missing), len(objects), cfg.LedgerFile)
+	for _, m := range missing {
+		log.Printf("  missing: %s (etag=%s)", m.Key, m.ETag)
+	}
+	return fmt.Errorf("reconcile: %d object(s) missing from the ledger -- rerun --once to process them", len(missing))
+}
+
+// objectFetcher is the subset of *s3source.Source runOnce needs to fetch
+// object bodies, so tests can supply a fake without a real S3 client.
+type objectFetcher interface {
+	FetchAndGunzip(ctx context.Context, key string) ([]byte, error)
+}
+
+// runOnce is the poll->fetch->parse->write->checkpoint pass described in
 // PLAN.md. It becomes the seam for a future Cloud Run Job/Lambda handler.
+// It doesn't know or care whether cp is ledger- or cursor-backed -- see
+// checkpoint.go's checkpointer doc comment.
 //
 // Named returns so the deferred status-setting below covers every return
 // path automatically: previously only the ListSince failure marked the
@@ -159,7 +237,7 @@ func applySourceOverrides(cfg *Config, s3Prefix, cursorFile string) error {
 // contains the real account ID -- see docs/observability.md's data
 // minimization rule. The specific failure reason is still on whichever
 // child span (fetch_object/process_object) set its own categorized status.
-func runOnce(ctx context.Context, src *s3source.Source, schema avro.Schema, cfg Config) (total int, err error) {
+func runOnce(ctx context.Context, src objectFetcher, cp checkpointer, schema avro.Schema, cfg Config) (total int, err error) {
 	tracer := otel.Tracer("crosslake-poller")
 	ctx, span := tracer.Start(ctx, "poll")
 	defer span.End()
@@ -173,18 +251,13 @@ func runOnce(ctx context.Context, src *s3source.Source, schema avro.Schema, cfg 
 		span.SetAttributes(attribute.Int64("poll.duration_ms", time.Since(started).Milliseconds()))
 	}()
 
-	cur, err := cursor.Load(cfg.CursorFile)
-	if err != nil {
-		return 0, err
-	}
-
-	keys, err := src.ListSince(ctx, cur.LastKey)
+	pending, err := cp.Pending(ctx)
 	if err != nil {
 		span.SetStatus(codes.Error, "list_failed")
 		return 0, err
 	}
-	span.SetAttributes(attribute.Int("s3.objects_found", len(keys)))
-	if len(keys) == 0 {
+	span.SetAttributes(attribute.Int("s3.objects_found", len(pending)))
+	if len(pending) == 0 {
 		return 0, nil
 	}
 
@@ -204,25 +277,25 @@ func runOnce(ctx context.Context, src *s3source.Source, schema avro.Schema, cfg 
 	// LEARNINGS.md); parsing and writing that chunk's results then runs
 	// strictly sequentially, in listing order, before the chunk's single
 	// flush+checkpoint -- disksink.Sink isn't safe for concurrent writes,
-	// and the cursor's meaning depends on listing order regardless of
-	// which fetch happened to finish first over the network.
+	// and the ledger/cursor checkpoint's meaning depends on knowing exactly
+	// which objects that flush covered.
 	total = 0 // total is a named return now, so this reassigns rather than shadows
-	for chunkStart := 0; chunkStart < len(keys); chunkStart += cfg.CheckpointEveryObjects {
+	for chunkStart := 0; chunkStart < len(pending); chunkStart += cfg.CheckpointEveryObjects {
 		chunkEnd := chunkStart + cfg.CheckpointEveryObjects
-		if chunkEnd > len(keys) {
-			chunkEnd = len(keys)
+		if chunkEnd > len(pending) {
+			chunkEnd = len(pending)
 		}
-		chunk := keys[chunkStart:chunkEnd]
+		chunk := pending[chunkStart:chunkEnd]
 
 		bodies, fetchErrs := fetchChunkConcurrently(ctx, src, tracer, chunk, chunkStart, cfg.FetchConcurrency)
 		for i, err := range fetchErrs {
 			if err != nil {
-				return total, fmt.Errorf("fetching object %d (%s): %w", chunkStart+i, chunk[i], err)
+				return total, fmt.Errorf("fetching object %d (%s): %w", chunkStart+i, chunk[i].Key, err)
 			}
 		}
 
-		var lastKeyInChunk string
-		for i, key := range chunk {
+		committed := make([]committedObject, len(chunk))
+		for i, obj := range chunk {
 			objectIndex := chunkStart + i
 			_, objSpan := tracer.Start(ctx, "process_object")
 			objSpan.SetAttributes(attribute.Int("object.index", objectIndex))
@@ -234,7 +307,7 @@ func runOnce(ctx context.Context, src *s3source.Source, schema avro.Schema, cfg 
 			if err := json.Unmarshal(bodies[i], &blob); err != nil {
 				objSpan.SetStatus(codes.Error, "decode_failed")
 				objSpan.End()
-				return total, fmt.Errorf("unmarshal %s: %w", key, err)
+				return total, fmt.Errorf("unmarshal %s: %w", obj.Key, err)
 			}
 
 			for _, raw := range blob.Records {
@@ -242,7 +315,7 @@ func runOnce(ctx context.Context, src *s3source.Source, schema avro.Schema, cfg 
 				if err != nil {
 					objSpan.SetStatus(codes.Error, "record_parse_failed")
 					objSpan.End()
-					return total, fmt.Errorf("parsing record from %s: %w", key, err)
+					return total, fmt.Errorf("parsing record from %s: %w", obj.Key, err)
 				}
 				if err := sink.WriteRecord(raw, rec); err != nil {
 					objSpan.SetStatus(codes.Error, "record_write_failed")
@@ -257,7 +330,7 @@ func runOnce(ctx context.Context, src *s3source.Source, schema avro.Schema, cfg 
 				attribute.Int64("object.duration_ms", time.Since(objectStarted).Milliseconds()),
 			)
 			objSpan.End()
-			lastKeyInChunk = key
+			committed[i] = committedObject{pendingObject: obj, RecordsWritten: len(blob.Records)}
 		}
 
 		// OCF writes are buffered, and Flush forces a new compression
@@ -266,17 +339,16 @@ func runOnce(ctx context.Context, src *s3source.Source, schema avro.Schema, cfg 
 		// roughly double the Avro file size on a real batch (see
 		// LEARNINGS.md). Batching every CheckpointEveryObjects objects
 		// (default 100) restores healthy block sizes while keeping the
-		// same durability property: the cursor still never advances past
-		// data that hasn't been flushed. A crash mid-batch just means the
-		// next run re-fetches and re-appends that batch's objects -- the
-		// same at-least-once/idempotent-replay model as before, just over
-		// a larger, tunable window instead of a hidden per-object one.
+		// same durability property: the checkpoint still never advances
+		// past data that hasn't been flushed. A crash mid-batch just means
+		// the next run re-fetches and re-processes that batch's objects --
+		// the same at-least-once/idempotent-replay model as before, just
+		// over a larger, tunable window instead of a hidden per-object one.
 		if err := sink.Flush(); err != nil {
-			return total, fmt.Errorf("flush after chunk ending %s: %w", lastKeyInChunk, err)
+			return total, fmt.Errorf("flush after chunk ending %s: %w", chunk[len(chunk)-1].Key, err)
 		}
-		cur.LastKey = lastKeyInChunk
-		if err := cursor.Save(cfg.CursorFile, cur); err != nil {
-			return total, fmt.Errorf("checkpoint after chunk ending %s: %w", lastKeyInChunk, err)
+		if err := cp.Commit(committed); err != nil {
+			return total, fmt.Errorf("checkpoint after chunk ending %s: %w", chunk[len(chunk)-1].Key, err)
 		}
 	}
 
@@ -286,18 +358,18 @@ func runOnce(ctx context.Context, src *s3source.Source, schema avro.Schema, cfg 
 
 // fetchChunkConcurrently fetches and gunzips a chunk of S3 objects with up
 // to concurrency requests in flight at once. Results are returned in the
-// same order as keys (bodies[i] / errs[i] correspond to keys[i]) regardless
-// of completion order, since the caller must process and checkpoint them in
-// listing order.
+// same order as chunk (bodies[i] / errs[i] correspond to chunk[i])
+// regardless of completion order, since the caller must process and
+// checkpoint them in listing order.
 func fetchChunkConcurrently(
-	ctx context.Context, src *s3source.Source, tracer trace.Tracer, keys []string, startIndex, concurrency int,
+	ctx context.Context, src objectFetcher, tracer trace.Tracer, chunk []pendingObject, startIndex, concurrency int,
 ) (bodies [][]byte, errs []error) {
-	bodies = make([][]byte, len(keys))
-	errs = make([]error, len(keys))
+	bodies = make([][]byte, len(chunk))
+	errs = make([]error, len(chunk))
 
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
-	for i, key := range keys {
+	for i, obj := range chunk {
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(i int, key string) {
@@ -315,7 +387,7 @@ func fetchChunkConcurrently(
 				bodies[i] = body
 			}
 			objSpan.End()
-		}(i, key)
+		}(i, obj.Key)
 	}
 	wg.Wait()
 	return bodies, errs

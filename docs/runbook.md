@@ -22,23 +22,49 @@ make poll-once
 
 Confirms: S3 `ListObjectsV2` + gunzip works, `./data/raw.jsonl` grows,
 `./data/tier3-avro/events.avro` grows (appends across runs -- see
-`LEARNINGS.md` bug #1), cursor advances (`tools/poller/cursor.json`,
-gitignored). Restrict this command to a closed, day-scoped prefix. Continuous
-or repeated polling with the current `last_key` cursor can miss late CloudTrail
-deliveries; see `docs/review-telemetry-plan.md`.
+`LEARNINGS.md` bug #1), the ledger (`tools/poller/ledger.json`, gitignored)
+records every object committed this run. `--once` re-lists the whole
+configured prefix every run and diffs against the ledger (keyed by
+`bucket, key, etag`) rather than a lexicographic boundary -- see
+`internal/ledger`'s package doc for the real inventory data
+(`docs/review-telemetry-plan.md`) showing why a `last_key` cursor can
+permanently skip out-of-order CloudTrail deliveries. This makes `--once`
+safe to rerun against the same closed prefix (already-committed objects are
+skipped, nothing is reprocessed or lost), but it should still be a closed,
+day-scoped prefix -- re-listing a still-growing prefix can't skip objects,
+but can't prove completeness at a given instant either.
 
-Loop mode is blocked by default. `make poll-loop` explicitly acknowledges the
+Loop mode is blocked by default and unchanged by the ledger: it still uses
+the legacy last-key cursor (`tools/poller/cursor.json`), since making
+continuous polling of a *growing* prefix both safe and cheap needs S3 event
+notifications/SQS plus a reconciliation cadence, not just the ledger (see
+PLAN.md "Explicit future work"). `make poll-loop` explicitly acknowledges the
 known unsafe cursor and exists only for controlled experiments; do not use it
 for completeness-sensitive ingestion.
 
-For a closed-prefix backfill, override the prefix and cursor together so the
-experiment cannot move the configured cursor:
+To check a closed prefix for gaps without processing anything (e.g. to catch
+a late delivery that arrived after an earlier `--once` run already committed
+past where it would have sorted), run in read-only reconcile mode:
+
+```sh
+cd tools/poller
+go run ./cmd/poller --mode=local --reconcile \
+  --s3-prefix 'AWSLogs/<account-id>/CloudTrail/us-east-1/YYYY/MM/DD/' \
+  --ledger-file './ledger-YYYY-MM-DD.json'
+```
+
+It exits non-zero and lists each missing key if the ledger doesn't yet cover
+every object S3 has; rerun `--once` (below) to pick those up.
+
+For a closed-prefix backfill, override the prefix, cursor, and ledger
+together so the experiment cannot touch the configured live cursor/ledger:
 
 ```sh
 cd tools/poller
 go run ./cmd/poller --mode=local --once \
   --s3-prefix 'AWSLogs/<account-id>/CloudTrail/us-east-1/YYYY/MM/DD/' \
-  --cursor-file './cursor-YYYY-MM-DD.json'
+  --cursor-file './cursor-YYYY-MM-DD.json' \
+  --ledger-file './ledger-YYYY-MM-DD.json'
 ```
 
 Sanity-check Tier 3 directly:
@@ -84,7 +110,7 @@ summary rather than one span per CloudTrail record.
 ## Resetting to a clean run
 
 ```sh
-rm -f tools/poller/cursor.json
+rm -f tools/poller/cursor.json tools/poller/ledger.json
 rm -rf data/
 ```
 

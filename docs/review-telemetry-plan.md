@@ -179,13 +179,27 @@ Questions the telemetry should answer directly:
 
 ### Phase 0 — make Local Mode trustworthy
 
-- Add the object ledger and closed-prefix safety checks.
-- Land immutable raw inputs and a run/cohort manifest.
-- Reconcile object and record counts before reporting.
-- Add synthetic contract tests and crash/retry tests.
+- [x] Add the object ledger and closed-prefix safety checks. Landed on
+      `ledger-and-manifest`: `internal/ledger`, `s3source.Source.List`
+      (full listing, no `StartAfter`), `--once`'s `ledgerCheckpointer`,
+      and read-only `--reconcile`. See `LEARNINGS.md` #20.
+- [ ] Land immutable raw inputs and a run/cohort manifest. Not started --
+      `run_id`/`cohort_id`, per-stage counts, and output fingerprints
+      still don't exist as a durable artifact; `tools/compare` still
+      relies on manually matching `aws.s3_prefixes` (`LEARNINGS.md` #19).
+- [ ] Reconcile object and record counts before reporting. `--reconcile`
+      covers object-level gaps for one prefix at a time; nothing yet ties
+      that into `tools/compare`'s reports or checks record-level counts.
+- [x]/[ ] Add synthetic contract tests and crash/retry tests. Crash/retry:
+      done for the ledger (`TestRunOnceLedgerCrashRetryReprocessesOnlyUnflushedChunk`).
+      Synthetic schema-variant contract tests (the P1 "schema conclusions
+      are premature" finding): not started.
 
-Exit: rerunning or crashing at every checkpoint produces no missing records;
-all tier fingerprints match for a fixed cohort.
+Exit: rerunning or crashing at every checkpoint produces no missing records
+(true for the ledger's own bookkeeping now; not yet proven end-to-end
+against the raw/Avro pair together, which item 4 in `LEARNINGS.md` notes
+still isn't transactional); all tier fingerprints match for a fixed cohort
+(not yet -- this is the manifest work above).
 
 ### Phase 1 — build the experiment harness
 

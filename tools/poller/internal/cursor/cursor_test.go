@@ -31,7 +31,9 @@ func TestSaveLoadAndReplace(t *testing.T) {
 		t.Fatalf("cursor permissions = %o, want 600", got)
 	}
 
-	matches, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".cursor-*"))
+	// Temp file naming moved to internal/atomicfile (".atomicfile-*") when
+	// cursor.go was refactored onto it -- see atomicfile.go's package doc.
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".atomicfile-*"))
 	if err != nil {
 		t.Fatalf("Glob: %v", err)
 	}

@@ -173,11 +173,13 @@ crosslake/
   tools/
     poller/                    # Go
       cmd/poller/main.go
-      internal/s3source/       # ListObjectsV2 + cursor-based paging (AWS S3 source)
+      internal/s3source/       # ListObjectsV2: full-prefix List + legacy ListSince (AWS S3 source)
       internal/pubsubsink/     # Cloud sink: dual publish to GCP Pub/Sub (raw + avro)
       internal/disksink/       # Local sink: writes raw.jsonl + typed Avro OCF
       internal/avroenc/        # hamba/avro against schema/cloudtrail.avsc
-      internal/cursor/         # local JSON cursor file
+      internal/cursor/         # legacy last-key cursor file (unsafe loop mode only)
+      internal/ledger/         # seen-object set (bucket,key,etag) backing --once/--reconcile
+      internal/atomicfile/     # shared atomic JSON read/write, used by cursor + ledger
       internal/telemetry/      # OTEL TracerProvider setup (OTLP/HTTP → Logfire), span helpers
       schema/cloudtrail.avsc
       config.example.yaml
@@ -240,11 +242,18 @@ buckets, for a simpler IAM surface.
 ## Poller (Go, `tools/poller`)
 
 - **Source & Sink abstraction**:
-  - **Source is always AWS S3**: `internal/s3source` uses `ListObjectsV2` with
-    `StartAfter`. The original assumption that CloudTrail delivery follows key
-    order is false; this cursor is safe only for a closed immutable prefix.
-    Loop mode now requires an explicit unsafe opt-in until a seen-object ledger
-    and reconciliation pass replace it.
+  - **Source is always AWS S3**: `internal/s3source` exposes both `List`
+    (full prefix listing, no `StartAfter`) and the legacy `ListSince`
+    (`StartAfter`-based). The original assumption that CloudTrail delivery
+    follows key order is false. The supported `--once` path now uses
+    `internal/ledger` (a seen-object set keyed by `bucket, key, etag`) via
+    `List` instead of a lexicographic boundary — see `LEARNINGS.md` #20 and
+    `docs/review-telemetry-plan.md`. Continuous loop mode still uses the old
+    `ListSince`/cursor and still requires an explicit unsafe opt-in: the
+    ledger fixes replay/re-run safety for a closed prefix, not completeness
+    against a still-growing one, which needs event notifications plus a
+    reconciliation cadence (see "Explicit future work" below). `--reconcile`
+    re-lists a closed prefix and reports gaps against the ledger read-only.
   - **Gotcha**: each S3 object is gzip JSON of `{"Records": [...]}` — gunzip,
     then process each *individual record*, not the compressed blob or array.
   - **Pluggable Sink interface (`internal/sink`)**:

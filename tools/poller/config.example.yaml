@@ -10,8 +10,8 @@ aws:
   # Narrow this to one account/region to keep local runs fast; ListObjectsV2
   # is paginated but CloudTrail buckets can hold years of history. This is
   # the poller's own live-tailing prefix; ingesting other days is done via
-  # `poller --s3-prefix=... --cursor-file=...` (see docs/runbook.md), not by
-  # editing this value.
+  # `poller --s3-prefix=... --cursor-file=... --ledger-file=...` (see
+  # docs/runbook.md), not by editing this value.
   s3_prefix: AWSLogs/123456789012/CloudTrail/us-east-1/
   # Optional, tools/compare only (the Go poller ignores this key): a list
   # of prefixes whose union is the S3 baseline for compare.*, for when the
@@ -26,7 +26,14 @@ aws:
 local:
   data_dir: ../../data # repo-root ./data -- run poller from tools/poller (see Makefile)
 
-cursor_file: ./cursor.json # tools/poller/cursor.json, gitignored
+cursor_file: ./cursor.json # tools/poller/cursor.json, gitignored -- legacy,
+  # used only by --allow-unsafe-last-key-polling loop mode
+ledger_file: ./ledger.json # tools/poller/ledger.json, gitignored -- the
+  # supported --once path's seen-object set, keyed by (bucket, key, etag).
+  # See internal/ledger's package doc for why this replaces the cursor for
+  # a closed prefix: a last-key boundary can permanently skip a
+  # CloudTrail object that's delivered out of lexicographic order, which a
+  # real inventory replay showed happening (docs/review-telemetry-plan.md).
 poll_interval_seconds: 60
 
 # How many S3 objects to process between flush+cursor-checkpoints. Flushing

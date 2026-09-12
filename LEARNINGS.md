@@ -436,6 +436,62 @@ numbers will vary with whatever's currently polled into `./data/`.
   tag) is a genuine Avro-vs-Parquet typing difference, not a bug -- see
   `docs/schema-design-notes.md`.
 
+## Object ledger: closing the P0 cursor gap (branch `ledger-and-manifest`)
+
+20. **Replaced the last-key cursor with a seen-object ledger for the
+    supported `--once` path.** Item 3 above found a real, non-hypothetical
+    data-loss bug: a `last_key`/`StartAfter` cursor assumes CloudTrail
+    delivery is lexicographically ordered, and a read-only replay of one
+    real day showed that's false often enough to matter (419/877 and 16/66
+    same-minute inversions in the two busiest regions; a 60s poll would
+    have silently and permanently dropped ~39.3%/~13.6% of those regions'
+    objects). No polling interval fixes this, because the ordering
+    assumption itself is false.
+
+    `internal/ledger` instead persists a set of objects already committed,
+    identified by `(bucket, key, etag)` rather than position. `--once` now
+    calls `s3source.Source.List` (a full prefix listing, no `StartAfter`)
+    every run and diffs it against the ledger via `cmd/poller`'s new
+    `checkpointer` interface -- `ledgerCheckpointer` for `--once`,
+    unchanged `cursorCheckpointer` (wrapping the old cursor) for the
+    still-gated `--allow-unsafe-last-key-polling` loop path. An entry is
+    only written to the ledger after that object's records have been
+    flushed to the sink (`ledger.Record`, called from the same
+    checkpoint-batch boundary that used to call `cursor.Save`), preserving
+    the existing at-least-once/idempotent-replay model -- just keyed by
+    object identity instead of a batch boundary.
+
+    Added a genuine crash/retry test
+    (`TestRunOnceLedgerCrashRetryReprocessesOnlyUnflushedChunk`): a fetch
+    failure is injected mid-second-chunk, the run is confirmed to have
+    committed only the first chunk to the ledger, then a fresh
+    checkpointer (simulating a process restart) reloads the ledger from
+    disk and is confirmed to reprocess only the uncommitted chunk -- the
+    union of both runs writes every object's record exactly once, checked
+    directly against `raw.jsonl`'s line count. This is
+    `docs/review-telemetry-plan.md`'s Phase 0 exit criterion
+    ("rerunning or crashing at every checkpoint produces no missing
+    records") for the ledger specifically, not yet for the two-file
+    raw/Avro pair (item 4's "not a transaction" caveat still applies).
+
+    Also added `--reconcile`: a read-only mode that re-lists a prefix and
+    reports any object present in S3 but absent from the ledger, without
+    fetching or processing it -- meant to be re-run later against the same
+    closed prefix to catch a late delivery that arrived after an earlier
+    run already committed past where it would have sorted, which is
+    exactly the failure a `last_key` cursor hides permanently.
+
+    **Not yet done** (see `docs/review-telemetry-plan.md`'s Phase 0):
+    the durable run/cohort manifest (`run_id`/`cohort_id`, per-stage
+    counts, output content fingerprints) that would let `tools/compare`
+    fail closed on a cohort mismatch automatically, rather than relying on
+    manually matching `aws.s3_prefixes` (item 19). Continuous polling of a
+    still-*growing* prefix also remains on the legacy cursor and
+    explicitly unsafe -- the ledger fixes replay/re-run safety for a
+    closed prefix, not the separate "did every object even exist in S3
+    yet at poll time" problem, which needs event notifications plus a
+    reconciliation cadence (`PLAN.md` "Explicit future work").
+
 ## Open questions / next experiments
 
 - Re-run at a larger batch size (multiple days) to see whether the
