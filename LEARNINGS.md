@@ -508,6 +508,69 @@ numbers will vary with whatever's currently polled into `./data/`.
     the exact failing case: the `reconcile` span for the same
     "882 missing" scenario now lands with `otel_status_code: ERROR`.
 
+## Run/cohort manifest: closing the "uncontrolled cohort" gap (branch `ledger-and-manifest`)
+
+22. **Added a durable, ingest-time manifest, and it caught a real duplicate-
+    record bug on its first real run -- not a contrived test case.**
+    `docs/review-telemetry-plan.md`'s "the comparison cohort is
+    uncontrolled" finding wanted a manifest written at ingest time, checked
+    against at compare time, so a cohort mismatch fails closed. This project
+    already had one working piece of that -- `queries.sql`'s
+    `cohort_signature` (an order-independent eventID-set fingerprint,
+    checked via `views_match` in `report.py`) -- but that only proves the
+    three comparison views agree *with each other* at query time. It can't
+    prove that agreement matches what the poller actually, durably
+    committed at ingest time: if any tier were regenerated after S3 drifted,
+    all three could agree with each other on a wrong cohort and
+    `cohort_signature` would report a clean reconciliation anyway.
+
+    `internal/manifest` (Go) builds a `Document` from the ledger's current
+    state after every `--once` run: `run_id`, `cohort_id` (derived from
+    `bucket+prefix`), `git_commit` (falls back to `git rev-parse HEAD` --
+    see the `go run` gotcha below), `schema_version` (hash of
+    `cloudtrail.avsc`'s bytes), `object_count`, `total_bytes`,
+    `total_records`, and `objects_fingerprint` (an order-independent hash
+    of every committed `(key, etag)` pair -- proved order-independent by
+    test, feeding the same two objects to two ledgers in opposite order).
+    Written to `<ledger-file>.manifest.json`, gitignored. `compare/manifest.py`
+    loads it (or several, for a multi-prefix cohort, via a new
+    `manifest_files:` config key mirroring `aws.s3_prefixes`) and checks
+    `sizes.py`'s live S3 object count/bytes and `s3_baseline`/
+    `tier2_parquet`/`tier3_avro`'s live row counts against it, failing
+    closed (never silently passing) if any disagree or if no manifest
+    exists yet. Wired into `report.py`'s overall pass/fail gate alongside
+    `cohort_signature`.
+
+    **The real bug, found while verifying this against real data**: to
+    backfill a manifest for an already-ingested 09/10 prefix whose ledger
+    file had been deleted during earlier testing, re-running `--once`
+    against that prefix treated all 882 objects as new (correctly, per the
+    ledger's own contract) and re-appended their records into the *shared*
+    `raw.jsonl`/`tier3-avro/events.avro` -- which still held that prefix's
+    records from before the ledger was deleted. `tier3_avro_record_count`
+    came back 6,812 against a manifest total of 4,491, while
+    `s3_baseline`/`tier2_parquet` (regenerated from a clean `raw.jsonl`
+    before the duplicate re-ingest) still correctly read 4,491. Nothing
+    at the disksink layer would have caught this -- only the new
+    manifest check did. Fixed by wiping `data/` and re-ingesting both
+    prefixes cleanly rather than trying to patch the duplicated files; see
+    `docs/runbook.md`'s new warning against deleting a ledger for a prefix
+    whose `data_dir` output is being kept.
+
+    **Also found while wiring this up**: `go run` -- the command every doc
+    example in this repo uses -- never embeds the Go toolchain's VCS build
+    info at all (confirmed directly: `debug.ReadBuildInfo()` returns no
+    `vcs.*` settings under `go run`, only under `go build`). Without a
+    `git rev-parse HEAD` fallback, `git_commit` would have been silently
+    empty for the documented workflow, not just as a rare edge case.
+
+    **Not yet done**: per-stage input/accepted/rejected/duplicate counts
+    (the poller has no concept of a "rejected" record today -- a parse
+    failure aborts the whole run rather than being counted and skipped);
+    synthetic schema-variant contract tests (the P1 "schema conclusions are
+    premature" finding). See `docs/review-telemetry-plan.md`'s updated
+    Phase 0 checklist.
+
 ## Open questions / next experiments
 
 - Re-run at a larger batch size (multiple days) to see whether the

@@ -56,15 +56,39 @@ go run ./cmd/poller --mode=local --reconcile \
 It exits non-zero and lists each missing key if the ledger doesn't yet cover
 every object S3 has; rerun `--once` (below) to pick those up.
 
-For a closed-prefix backfill, override the prefix, cursor, and ledger
-together so the experiment cannot touch the configured live cursor/ledger:
+**Never delete a ledger file for a prefix that's already been ingested into
+a `data_dir` you're keeping.** The ledger only prevents *its own* re-ingest;
+`raw.jsonl`/`tier3-avro/events.avro` are append-only and have no memory of
+their own. A missing ledger makes every object look new again, so `--once`
+silently re-appends records already durably written -- hit for real while
+building this (see `LEARNINGS.md`), caught only because
+`compare.manifest`'s record-count check flagged `tier3_avro`'s row count
+disagreeing with the manifest and every other tier. If a ledger is lost,
+either restore it from backup or wipe and re-ingest that prefix's `data_dir`
+output cleanly rather than re-running `--once` against the old one.
+
+For a closed-prefix backfill, override the prefix and ledger together so the
+experiment cannot touch the configured live ledger (`--once`/`--reconcile`
+are ledger-only, so `--cursor-file` isn't needed here -- it's only required
+alongside `--s3-prefix` for loop mode):
 
 ```sh
 cd tools/poller
 go run ./cmd/poller --mode=local --once \
   --s3-prefix 'AWSLogs/<account-id>/CloudTrail/us-east-1/YYYY/MM/DD/' \
-  --cursor-file './cursor-YYYY-MM-DD.json' \
   --ledger-file './ledger-YYYY-MM-DD.json'
+```
+
+This also writes a durable manifest next to the ledger
+(`ledger-YYYY-MM-DD.manifest.json` -- see `internal/manifest`), recording
+the object count, compressed bytes, and an order-independent
+`(key, etag)` fingerprint for everything committed so far. `tools/compare`
+cross-checks its live numbers against this file (`compare/manifest.py`) --
+list every manifest for a multi-prefix cohort under `manifest_files:` in
+`config.yaml` (see `config.example.yaml`). Check it standalone with:
+
+```sh
+make compare-manifest
 ```
 
 Sanity-check Tier 3 directly:
@@ -96,7 +120,8 @@ make compare-sizes    # unreconciled remote/local size inventory
 make compare-schema   # side-by-side Tier 2 vs Tier 3 column types
 make compare-bench    # warmups + 5 randomized trials; validates result hashes
 make compare-encode   # repeated/randomized same-process encode benchmark
-make compare-report   # Markdown + gitignored JSON evidence under data/reports/
+make compare-manifest # live numbers vs the poller's durable manifest(s); fails closed on mismatch
+make compare-report   # Markdown + gitignored JSON evidence under data/reports/ -- includes the manifest check, fails closed if it doesn't pass
 ```
 
 ## 4. Confirm telemetry
@@ -110,7 +135,7 @@ summary rather than one span per CloudTrail record.
 ## Resetting to a clean run
 
 ```sh
-rm -f tools/poller/cursor.json tools/poller/ledger.json
+rm -f tools/poller/cursor.json tools/poller/ledger*.json tools/poller/*.manifest.json
 rm -rf data/
 ```
 

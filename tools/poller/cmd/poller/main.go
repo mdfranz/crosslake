@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"github.com/mdfranz/crosslake/tools/poller/internal/avroenc"
 	"github.com/mdfranz/crosslake/tools/poller/internal/disksink"
 	"github.com/mdfranz/crosslake/tools/poller/internal/ledger"
+	"github.com/mdfranz/crosslake/tools/poller/internal/manifest"
 	"github.com/mdfranz/crosslake/tools/poller/internal/s3source"
 	"github.com/mdfranz/crosslake/tools/poller/internal/telemetry"
 
@@ -153,11 +155,24 @@ func run() int {
 		if err != nil {
 			return fail("loading ledger %s: %v", cfg.LedgerFile, err)
 		}
+		started := time.Now()
 		n, err := runOnce(ctx, src, cp, schema, cfg)
 		if err != nil {
 			return fail("poll failed: %v", err)
 		}
 		log.Printf("done: %d record(s) written to %s", n, cfg.Local.DataDir)
+
+		// Write the durable ingest-time manifest tools/compare's
+		// manifest.py cross-checks its live query results against -- see
+		// internal/manifest's package doc. Built from the ledger's full
+		// current state (not just this run's delta), so it reflects the
+		// cohort as of right now even when --once was a no-op rerun.
+		doc := manifest.Build(cp.Ledger(), cfg.AWS.S3Bucket, cfg.AWS.S3Prefix, schemaBytes, started)
+		mPath := manifestPath(cfg.LedgerFile)
+		if err := manifest.Save(doc, mPath); err != nil {
+			return fail("writing manifest %s: %v", mPath, err)
+		}
+		log.Printf("manifest: %s (cohort=%s, objects=%d, records=%d)", mPath, doc.CohortID, doc.ObjectCount, doc.TotalRecords)
 		return 0
 	}
 
@@ -185,6 +200,17 @@ func run() int {
 		case <-ticker.C:
 		}
 	}
+}
+
+// manifestPath derives the manifest file's path from the ledger file's, so
+// no separate config key is needed: ledger.json -> ledger.manifest.json,
+// ledger-2026-09-10.json -> ledger-2026-09-10.manifest.json. Falls back to
+// appending the suffix outright if ledgerFile doesn't end in ".json".
+func manifestPath(ledgerFile string) string {
+	if strings.HasSuffix(ledgerFile, ".json") {
+		return strings.TrimSuffix(ledgerFile, ".json") + ".manifest.json"
+	}
+	return ledgerFile + ".manifest.json"
 }
 
 // applySourceOverrides applies a backfill's --s3-prefix override, requiring

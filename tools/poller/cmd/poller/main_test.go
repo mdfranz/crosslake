@@ -218,6 +218,19 @@ func TestRunOnceLedgerCrashRetryReprocessesOnlyUnflushedChunk(t *testing.T) {
 	}
 }
 
+func TestManifestPath(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"ledger.json", "ledger.manifest.json"},
+		{"ledger-2026-09-10.json", "ledger-2026-09-10.manifest.json"},
+		{"./sub/ledger.json", "./sub/ledger.manifest.json"},
+		{"ledger", "ledger.manifest.json"}, // no ".json" suffix to strip
+	} {
+		if got := manifestPath(tc.in); got != tc.want {
+			t.Errorf("manifestPath(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func countLines(b []byte) int {
 	n := 0
 	for _, c := range b {

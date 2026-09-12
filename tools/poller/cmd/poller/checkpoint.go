@@ -87,6 +87,12 @@ func (c *ledgerCheckpointer) Pending(ctx context.Context) ([]pendingObject, erro
 	return pending, nil
 }
 
+// Ledger exposes the underlying ledger so main.go can build a
+// manifest.Document from it after a run completes -- see
+// internal/manifest's package doc for why that's a separate, durable
+// artifact rather than something checkpoint.go computes itself.
+func (c *ledgerCheckpointer) Ledger() *ledger.Ledger { return c.l }
+
 func (c *ledgerCheckpointer) Commit(chunk []committedObject) error {
 	for _, o := range chunk {
 		c.l.Record(c.bucket, o.Key, o.ETag, o.Size, o.RecordsWritten)

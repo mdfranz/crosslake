@@ -145,6 +145,21 @@ func (l *Ledger) Record(bucket, key, etag string, size int64, recordsWritten int
 // Len returns the number of committed entries, for logging/telemetry.
 func (l *Ledger) Len() int { return len(l.byID) }
 
+// Entries returns every committed entry for bucket, sorted by key -- the
+// basis for internal/manifest's aggregate counts and object-identity
+// fingerprint. Sorted (rather than map iteration order) so the fingerprint
+// is deterministic regardless of how entries were loaded or recorded.
+func (l *Ledger) Entries(bucket string) []Entry {
+	var entries []Entry
+	for _, e := range l.byID {
+		if e.Bucket == bucket {
+			entries = append(entries, e)
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
+	return entries
+}
+
 // Missing returns the subset of objects not yet committed for bucket, in
 // the same order they were given. Callers pass a fresh S3 listing (see
 // s3source.Source.List) to find new work (the normal --once path) or, run

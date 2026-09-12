@@ -4,7 +4,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: poll-once poll-loop beam-local compare-sizes compare-schema compare-bench compare-encode compare-report go-build go-test
+.PHONY: poll-once poll-loop beam-local compare-sizes compare-schema compare-bench compare-encode compare-manifest compare-report go-build go-test
 
 poll-once:
 	cd tools/poller && \
@@ -36,6 +36,9 @@ compare-bench:
 
 compare-encode:
 	cd tools/compare && . ../../scripts/logfire-env.sh && uv run python3 -m compare.encode_bench
+
+compare-manifest:
+	cd tools/compare && . ../../scripts/logfire-env.sh && uv run python3 -m compare.manifest
 
 compare-report:
 	cd tools/compare && . ../../scripts/logfire-env.sh && uv run python3 -m compare.report

@@ -23,6 +23,17 @@ aws:
   #   - AWSLogs/123456789012/CloudTrail/us-east-1/2026/09/10/
   #   - AWSLogs/123456789012/CloudTrail/us-east-1/2026/09/11/
 
+# Optional, tools/compare only (the Go poller ignores this key too): manifest
+# files to reconcile against, one per ledger/prefix in a multi-day cohort --
+# see internal/manifest and compare/manifest.py. A plain --once run always
+# writes one manifest next to its ledger file (ledger.json ->
+# ledger.manifest.json); this list is only needed once s3_prefixes above
+# lists more than one prefix, so compare.* knows every manifest to sum
+# against the live numbers. Order doesn't matter.
+# manifest_files:
+#   - ledger-2026-09-10.manifest.json
+#   - ledger.manifest.json
+
 local:
   data_dir: ../../data # repo-root ./data -- run poller from tools/poller (see Makefile)
 

@@ -180,10 +180,11 @@ crosslake/
       internal/cursor/         # legacy last-key cursor file (unsafe loop mode only)
       internal/ledger/         # seen-object set (bucket,key,etag) backing --once/--reconcile
       internal/atomicfile/     # shared atomic JSON read/write, used by cursor + ledger
+      internal/manifest/       # durable run/cohort manifest, built from the ledger after --once
       internal/telemetry/      # OTEL TracerProvider setup (OTLP/HTTP → Logfire), span helpers
       schema/cloudtrail.avsc
       config.example.yaml
-    compare/                   # Python + DuckDB: sizes.py, schema_inspect.py, query_bench.py, queries.sql, report.py, telemetry.py (logfire.configure())
+    compare/                   # Python + DuckDB: sizes.py, schema_inspect.py, query_bench.py, queries.sql, manifest.py, report.py, telemetry.py (logfire.configure())
   pipelines/parquet-writer/    # Python/Beam
     parquet_writer/pipeline.py, transforms.py, cloudtrail_schema.py, telemetry.py (logfire.configure())
     scripts/run_local.sh (DirectRunner), run_dataflow.sh (DataflowRunner)
@@ -390,7 +391,13 @@ One Logfire project, three service names, no separate Collector:
    run briefly, cancel the job, confirm Parquet output in GCS.
 9. Capture a closed, bounded source cohort in a manifest and require all three
    tiers to reconcile to its object and event fingerprints. Do not use the
-   current `last_key` loop for this step.
+   current `last_key` loop for this step. **Done for Local Mode**:
+   `internal/manifest` + `compare/manifest.py`, object-identity fingerprint
+   (`objects_fingerprint`) plus record counts checked against every tier,
+   fail-closed in `compare/report.py` -- see `LEARNINGS.md` #22. Event-level
+   (not just count-level) content fingerprinting across tiers is
+   `cohort_signature` in `queries.sql`, which predates this step. Not yet
+   extended to Cloud Mode, which doesn't exist yet.
 10. Run `tools/compare`: an explicitly labelled size inventory, a side-by-side schema dump,
     and query benchmarks using DuckDB across S3 and GCS:
     - S3 direct baseline: `SELECT unnest(Records)... FROM read_json('s3://...')`
