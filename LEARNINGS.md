@@ -239,6 +239,76 @@ concrete optimization targets, not hypothetical ones.
     move any real metric today. Worth revisiting only if item 13's fix
     ever makes fetch latency small enough for these to become visible.
 
+## Instrumentation audit (logfire-instrumentation skill)
+
+Audited existing instrumentation against the skill's guidance -- not a
+fresh instrumentation job, looking for gaps in what's already there.
+
+15. **The outer `poll` span never reflected failure for most error paths.**
+    Only the `ListSince` failure explicitly called `span.SetStatus` on the
+    top-level span; every later failure (fetch, decode, parse, write,
+    flush, checkpoint) returned straight past it. A failed poll would show
+    `poll` as OK/unset status in Logfire unless you happened to drill into
+    a child span. Fixed: `runOnce` now uses a named return
+    (`total int, err error`) with a `defer` that sets a generic
+    `"poll_failed"` status on `poll` whenever `err != nil`, covering every
+    return path automatically. Deliberately not `err.Error()` -- wrapped
+    errors can carry an S3 key (the real account ID), which is exactly
+    what item 3's `s3.key` fix already removed from spans once; the
+    specific reason still lives on whichever child span set its own
+    categorized status.
+
+16. **Rejected records in the Beam pipeline had zero diagnostic detail
+    reaching Logfire** -- Beam's per-element counters said *how many*
+    failed, never *why*; the actual error only ever reached the local
+    `_rejects` text file. First attempt at a fix read raw lines from that
+    file into a Logfire attribute -- caught before shipping: the file's
+    second field is the *full raw CloudTrail record* (`f"{error}\t{raw}"`,
+    see `transforms.py`'s `FormatRejects`), which can contain account IDs,
+    ARNs, source IPs. Even the error-message half was too much: messages
+    like `f"parse error: {e}"` count as "raw exception strings," which
+    `docs/observability.md`'s own data-minimization rule explicitly
+    excludes -- the same rule this project already enforces on the Go
+    side. Fixed at the source in `transforms.py`: tagged-output messages
+    now lead with `f"{type(e).__name__}: ..."`; `pipeline.py`'s
+    `_sample_rejects` keeps only that leading type name (e.g.
+    `"JSONDecodeError"`, purely structural, zero data) and discards
+    everything else, including the raw record, in-process. The summary log
+    now also switches from `logfire.info` to `logfire.warn` when any
+    records were rejected, so it's discoverable by level, not just by
+    reading a count. Verified end-to-end with a deliberately malformed test
+    record: Logfire received `sample_reject_types: ["JSONDecodeError"]`
+    and `level: 13` (WARN) -- confirmed nothing else came through.
+
+17. **No `service_version` or `deployment.environment` anywhere** -- every
+    `logfire.configure()`/Go resource only set `service_name`. Per the
+    skill, these are what power Logfire's Services page (RED metrics) and
+    let error rate/latency be compared across commits, directly useful
+    given how many fixes have landed in quick succession this session.
+    Added `service_version` (short git SHA) and `environment="local"` (vs.
+    a future "cloud" mode) to both Python `telemetry.py` modules and to
+    the Go `telemetry.Init()`. Go's own VCS build-info stamping
+    (`runtime/debug.ReadBuildInfo`) turned up empty in this git worktree,
+    so Go shells out to `git rev-parse --short HEAD` instead, matching
+    `report.py`'s existing pattern for the same data.
+
+18. **Found while verifying item 17: Go and Python disagreed on the
+    *attribute name* for deployment environment.** Python's Logfire SDK
+    emits `deployment.environment.name` (confirmed by inspecting its
+    resource attributes directly); Go's `semconv.DeploymentEnvironment()`
+    (pinned to semconv v1.26.0) emits the older `deployment.environment`
+    -- OTEL renamed this attribute, and the newer helper
+    (`DeploymentEnvironmentName`) isn't in v1.26.0. Left this way, Logfire
+    would show `env: "local"` for the Python services and `env: null` for
+    `crosslake-poller` under the query all three should share, silently
+    splitting the Services page by language rather than by actual
+    environment. Fixed by spelling the new key out explicitly
+    (`attribute.String("deployment.environment.name", "local")`) rather
+    than bumping the whole semconv import for one attribute. Verified: all
+    three services now agree (`crosslake-poller`, `crosslake-compare`
+    confirmed directly; `crosslake-parquet-writer` uses the same
+    `telemetry.py` pattern as `crosslake-compare`).
+
 ## Comparison results
 
 Real numbers from a batch of CloudTrail records pulled from live delivery

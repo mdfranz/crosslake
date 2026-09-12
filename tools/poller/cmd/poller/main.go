@@ -148,10 +148,26 @@ func applySourceOverrides(cfg *Config, s3Prefix, cursorFile string) error {
 
 // runOnce is the poll->fetch->parse->write->cursor-update pass described in
 // PLAN.md. It becomes the seam for a future Cloud Run Job/Lambda handler.
-func runOnce(ctx context.Context, src *s3source.Source, schema avro.Schema, cfg Config) (int, error) {
+//
+// Named returns so the deferred status-setting below covers every return
+// path automatically: previously only the ListSince failure marked the
+// outer "poll" span as an error (an explicit SetStatus at that one call
+// site) -- every other failure (fetch, decode, parse, write, flush,
+// checkpoint) returned straight past it, leaving "poll" showing as OK in
+// Logfire even when the run failed. A generic "poll_failed" status (not
+// err.Error()) is deliberate: wrapped errors can carry an S3 key, which
+// contains the real account ID -- see docs/observability.md's data
+// minimization rule. The specific failure reason is still on whichever
+// child span (fetch_object/process_object) set its own categorized status.
+func runOnce(ctx context.Context, src *s3source.Source, schema avro.Schema, cfg Config) (total int, err error) {
 	tracer := otel.Tracer("crosslake-poller")
 	ctx, span := tracer.Start(ctx, "poll")
 	defer span.End()
+	defer func() {
+		if err != nil {
+			span.SetStatus(codes.Error, "poll_failed")
+		}
+	}()
 	started := time.Now()
 	defer func() {
 		span.SetAttributes(attribute.Int64("poll.duration_ms", time.Since(started).Milliseconds()))
@@ -190,7 +206,7 @@ func runOnce(ctx context.Context, src *s3source.Source, schema avro.Schema, cfg 
 	// flush+checkpoint -- disksink.Sink isn't safe for concurrent writes,
 	// and the cursor's meaning depends on listing order regardless of
 	// which fetch happened to finish first over the network.
-	total := 0
+	total = 0 // total is a named return now, so this reassigns rather than shadows
 	for chunkStart := 0; chunkStart < len(keys); chunkStart += cfg.CheckpointEveryObjects {
 		chunkEnd := chunkStart + cfg.CheckpointEveryObjects
 		if chunkEnd > len(keys) {

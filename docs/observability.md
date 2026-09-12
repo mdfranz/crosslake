@@ -80,3 +80,13 @@ The authoritative experiment record is a gitignored run manifest containing
 cohort fingerprints, stage counts, versions, and benchmark parameters. Traces
 and metrics are a searchable projection. The rationale and target signal model
 are in [`review-telemetry-plan.md`](review-telemetry-plan.md).
+
+**"Raw exception strings" means exactly that -- even the message, not just
+obvious PII.** `pipelines/parquet-writer/parquet_writer/pipeline.py`'s
+`_sample_rejects` surfaces *why* records were rejected without violating
+this: it reads the exception *type name* only (`"JSONDecodeError"`,
+`"ValueError"`, ...) out of the local `_rejects` file, discarding the
+message text and the raw CloudTrail record that follow it on the same
+line. `f"parse error: {e}"`-style messages count as raw exception strings
+even though they look like a category label -- LEARNINGS.md item 16 has
+the full story, including catching this before it shipped.
