@@ -23,23 +23,38 @@ local disk sinks, DuckDB comparisons.
    `run_pipeline`, because Python's ambient OTEL context doesn't cross
    Beam's thread boundary. Fixed by capturing a W3C `traceparent` before
    building the pipeline graph and re-attaching it inside every
-   `DoFn.process()` call. Confirmed via a live Logfire query before and
-   after. See `docs/observability.md` and
-   `pipelines/parquet-writer/parquet_writer/transforms.py`.
+   `DoFn.process()` call. That made the trace tree look tidy but created one
+   remote span per record and implied false driver-to-worker causality. The
+   optimized design uses runner-native Beam counters/distributions and exports
+   one run summary instead. See `docs/observability.md`.
 
-3. **DuckDB's avro extension can't read hamba/avro's `zstandard`-codec OCF
+3. **A lexicographic S3 cursor loses late CloudTrail deliveries.** Read-only
+   inventory replay found same-minute key inversions and substantial simulated
+   omissions with `StartAfter`, including at long polling intervals. A single
+   cursor is even less valid across a trail-wide prefix because region precedes
+   date in the key. Continuous polling remains unsafe until an object ledger
+   and completeness reconciliation replace `last_key`; see
+   `docs/review-telemetry-plan.md`.
+
+4. **A checkpoint could outrun buffered output.** The poller saved its cursor
+   after encoding records but before the Avro OCF encoder was closed/flushed.
+   The optimized branch flushes and fsyncs both local representations before
+   atomically replacing the cursor. Two files still are not a transaction, so a
+   canonical raw landing plus derived outputs remains the target design.
+
+5. **DuckDB's avro extension can't read hamba/avro's `zstandard`-codec OCF
    files** ("File header contains an unknown codec"), even though the file
    is spec-valid Avro. Switched both sides to `deflate`/`gzip` (same zlib
    family) for a codec DuckDB, hamba/avro, and pyarrow all agree on.
 
-4. **`LOGFIRE_API_TOKEN` (set in this environment) is not a valid OTLP
+6. **`LOGFIRE_API_TOKEN` (set in this environment) is not a valid OTLP
    write token** -- it's scoped for the Logfire Claude Code plugin's own MCP
    calls, not ingestion, and gets a `401 Unauthorized` against
    `logfire-us.pydantic.dev/v1/traces`. Needed a real project write token
    via `uvx logfire --region=us auth` + `projects use`. See
    `docs/observability.md`.
 
-5. **Uncompressed defaults make any "vs. gzip" comparison meaningless.**
+7. **Uncompressed defaults make any "vs. gzip" comparison meaningless.**
    Both `WriteToParquet`'s default codec and `ocf`'s default codec are
    "none." Before fixing this, both tiers looked *worse* than the original
    gzipped CloudTrail JSON, which would have been a misleading headline
@@ -93,14 +108,14 @@ numbers will vary with whatever's currently polled into `./data/`.
 
 ### Reading these numbers
 
-- **Both formats beat the original gzip** once given a real codec (0.43x
-  and 0.46x of the gzipped JSON's size) -- columnar/binary encoding plus
-  compression wins even against gzip's own text compression, on top of
-  cutting the JSON parsing cost out of every future read.
-- **Querying the same data locally is ~1000x faster than querying gzipped
-  JSON directly off S3** (milliseconds vs. 9-16 *seconds* for the exact same
-  SQL) -- the single most concrete argument for building this pipeline at
-  all, independent of Avro vs. Parquet.
+- **The apparent size ratios are provisional.** The report did not prove that
+  the current S3 listing and cumulative local outputs represented exactly the
+  same cohort, and the typed tiers omit source fields. Treat the numbers as a
+  smoke result until a cohort manifest and retained-field accounting exist.
+- **The seconds-versus-milliseconds result primarily supports compaction and
+  localization.** The S3 side read hundreds of tiny remote gzip objects while
+  the typed sides read a few local files. It does not isolate JSON versus Avro
+  or Parquet and should not be described as a format speedup.
 - **Parquet edges out Avro on both size and encode speed** in this run
   (~7% smaller, ~15% faster to encode) -- but this is one small batch
   (~1450 records) encoded once in one process; not a claim that generalizes

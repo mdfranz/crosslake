@@ -14,7 +14,7 @@ def configure(service_name: str = "crosslake-parquet-writer") -> None:
     logfire.configure(
         service_name=service_name,
         advanced=logfire.AdvancedOptions(base_url="https://logfire-us.pydantic.dev"),
-        # A per-record span printed to stdout floods the console on a batch
-        # job with thousands of records; spans still ship to Logfire.
+        # Console output is intentionally quiet; one driver span and summary
+        # are exported while element-level counts stay in Beam metrics.
         console=False,
     )

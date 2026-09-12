@@ -24,8 +24,8 @@ type Sink struct {
 	ocfEnc   *ocf.Encoder
 }
 
-// New creates/truncates the local output files under dataDir. schema is the
-// parsed cloudtrail.avsc, used as the OCF container's header schema.
+// New creates or appends to the local output files under dataDir. schema is
+// the parsed cloudtrail.avsc, used as the OCF container's header schema.
 func New(dataDir string, schema avro.Schema) (*Sink, error) {
 	avroDir := filepath.Join(dataDir, "tier3-avro")
 	if err := os.MkdirAll(avroDir, 0o755); err != nil {
@@ -33,9 +33,13 @@ func New(dataDir string, schema avro.Schema) (*Sink, error) {
 	}
 
 	rawPath := filepath.Join(dataDir, "raw.jsonl")
-	rawFile, err := os.OpenFile(rawPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	rawFile, err := os.OpenFile(rawPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("disksink: open %s: %w", rawPath, err)
+	}
+	if err := rawFile.Chmod(0o600); err != nil {
+		rawFile.Close()
+		return nil, fmt.Errorf("disksink: chmod %s: %w", rawPath, err)
 	}
 
 	// ocf.NewEncoderWithSchema appends to an existing OCF file by reading its
@@ -46,10 +50,15 @@ func New(dataDir string, schema avro.Schema) (*Sink, error) {
 	// during testing: tier3 had only the latest run's 3 records while the
 	// other two tiers had the full 1456).
 	avroPath := filepath.Join(avroDir, "events.avro")
-	avroFile, err := os.OpenFile(avroPath, os.O_CREATE|os.O_RDWR, 0o644)
+	avroFile, err := os.OpenFile(avroPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		rawFile.Close()
 		return nil, fmt.Errorf("disksink: open %s: %w", avroPath, err)
+	}
+	if err := avroFile.Chmod(0o600); err != nil {
+		rawFile.Close()
+		avroFile.Close()
+		return nil, fmt.Errorf("disksink: chmod %s: %w", avroPath, err)
 	}
 
 	// Deflate: DuckDB's avro extension (used by tools/compare) rejects
@@ -77,6 +86,22 @@ func (s *Sink) WriteRecord(rawJSON []byte, rec *avroenc.Record) error {
 	}
 	if err := s.ocfEnc.Encode(rec); err != nil {
 		return fmt.Errorf("disksink: encode avro record: %w", err)
+	}
+	return nil
+}
+
+// Flush makes both representations durable before the caller advances its
+// source checkpoint. It does not make the pair transactional; reconciliation
+// metadata is still required to detect a crash between the two writes.
+func (s *Sink) Flush() error {
+	if err := s.ocfEnc.Flush(); err != nil {
+		return fmt.Errorf("disksink: flush ocf encoder: %w", err)
+	}
+	if err := s.rawFile.Sync(); err != nil {
+		return fmt.Errorf("disksink: sync raw.jsonl: %w", err)
+	}
+	if err := s.avroFile.Sync(); err != nil {
+		return fmt.Errorf("disksink: sync events.avro: %w", err)
 	}
 	return nil
 }

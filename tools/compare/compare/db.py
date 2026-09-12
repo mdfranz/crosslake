@@ -55,6 +55,7 @@ def connect(
             json_extract_string(r, '$.eventName') AS eventName,
             json_extract_string(r, '$.eventSource') AS eventSource,
             json_extract_string(r, '$.eventTime') AS eventTime,
+            json_extract_string(r, '$.eventID') AS eventID,
             r AS record
         FROM read_json('{s3_glob}', columns={{'Records': 'JSON[]'}}), unnest(Records) AS t(r)
     """)

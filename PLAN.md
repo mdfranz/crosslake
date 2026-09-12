@@ -1,5 +1,10 @@
 # CloudTrail (S3) → Pub/Sub → GCS: Avro vs Parquet Learning Pipeline
 
+> **2026-09-12 critical review:** the Local Mode prototype is useful but its
+> current cursor and comparison methodology cannot yet support completeness or
+> format-performance claims. See [`docs/review-telemetry-plan.md`](docs/review-telemetry-plan.md)
+> for evidence, code-level risks, telemetry design, and revised exit criteria.
+
 ## Status (as of first Local Mode build)
 
 **Built and verified end-to-end: Local Mode only.** Real AWS S3 CloudTrail
@@ -31,11 +36,9 @@ actually happened:
   deflate/gzip. DuckDB's `avro` extension additionally can't read
   `zstandard`-codec OCF files, ruling that codec out for Tier 3 as long as
   DuckDB is a consumer.
-- **Beam span parenting**: `DoFn.process()` runs outside the OTEL context
-  opened in `main()`, so per-record spans need an explicit W3C
-  `traceparent` re-attached in each call or they land as orphaned root
-  traces instead of children of the pipeline-run span. See
-  `docs/observability.md`.
+- **Beam telemetry**: per-record remote spans were removed. Worker-side counts
+  and distributions use Beam metrics; Logfire receives one driver span and a
+  compact run summary. See `docs/observability.md`.
 
 ## Context
 
@@ -53,11 +56,10 @@ a baseline/control tier, and builds two additional tiers that produce genuinely
 structured, typed output — one in Avro, one in Parquet — so the user gets a real
 apples-to-apples comparison rather than just re-deriving what they already know.
 
-Target repo: `/home/mdfranz/github/crosslake` — currently an empty git repo
-(no commits, no files), so this is a from-scratch scaffold. Scope is an
-explicit **learning prototype**: optimize for a working end-to-end pipeline and a
-clear, concrete comparison, not production hardening (HA/monitoring/DLQ are
-noted as future work only).
+This repository began as a from-scratch scaffold. Scope is an explicit
+**learning prototype**, but ingestion completeness, cohort reconciliation, and
+repeatable measurement are prerequisites for valid learnings rather than
+optional production hardening.
 
 ## Locked-in design decisions (from conversation)
 
@@ -239,9 +241,10 @@ buckets, for a simpler IAM surface.
 
 - **Source & Sink abstraction**:
   - **Source is always AWS S3**: `internal/s3source` uses `ListObjectsV2` with
-    `StartAfter`. CloudTrail's `AWSLogs/<acct>/CloudTrail/<region>/YYYY/MM/DD/...`
-    key layout is lexicographically time-ordered, making a string-key cursor
-    valid. Written after every successfully processed object.
+    `StartAfter`. The original assumption that CloudTrail delivery follows key
+    order is false; this cursor is safe only for a closed immutable prefix.
+    Loop mode now requires an explicit unsafe opt-in until a seen-object ledger
+    and reconciliation pass replace it.
   - **Gotcha**: each S3 object is gzip JSON of `{"Records": [...]}` — gunzip,
     then process each *individual record*, not the compressed blob or array.
   - **Pluggable Sink interface (`internal/sink`)**:
@@ -270,8 +273,9 @@ buckets, for a simpler IAM surface.
   `otlptracehttp` exporter reading `OTEL_EXPORTER_OTLP_ENDPOINT` /
   `OTEL_EXPORTER_OTLP_HEADERS` / `OTEL_SERVICE_NAME` from the environment
   (set via `.env`/Makefile, pointed at Logfire — see Observability section
-  below). `RunOnce` opens a root span; each S3 object and each published
-  record gets a child span with `mode`/`sink` attributes. **Gotcha**: `--once`
+  below). `RunOnce` opens a root span and each S3 object gets a child span with
+  aggregate bytes/record-count/duration attributes. Raw keys, raw errors, and
+  per-record spans are not exported. **Gotcha**: `--once`
   runs are short-lived, so `main.go` must call `tracerProvider.Shutdown(ctx)`
   (or `ForceFlush`) before exit or the batched exporter drops the last spans.
 - **CloudTrail schema shape** (central design challenge, called out
@@ -295,10 +299,9 @@ mirroring the Avro field list. `userIdentity` kept as a **nested struct column**
 the Avro record). Dual input mode (`--input_mode=file|pubsub`) lets pipeline
 logic be iterated for free against a saved `.jsonl` sample on `DirectRunner`
 before touching Dataflow/billing. `telemetry.py` calls `logfire.configure()`
-once at pipeline start; `ParseCloudTrailJson` wraps each element in a
-`logfire.span("parse_record")` and increments `logfire.metric_counter`s for
-parsed vs. rejected records — cheap on `DirectRunner`, and still cheap on
-Dataflow workers since the SDK batches export in the background.
+once at pipeline start. `ParseCloudTrailJson` uses Beam runner-native counters
+and distributions for accepted/rejected records, input sizes, and parse time;
+Logfire receives one driver span and one compact run summary.
 
 Dataflow job itself is **not** a Pulumi-managed resource (that resource type
 targets template artifacts; a custom Beam pipeline would need a Flex Template
@@ -322,26 +325,21 @@ One Logfire project, three service names, no separate Collector:
   OTEL_EXPORTER_OTLP_HEADERS=Authorization=${LOGFIRE_TOKEN}
   OTEL_SERVICE_NAME=crosslake-poller
   ```
-- **Python (`pipelines/parquet-writer`, `tools/compare`)**: `pip install
-  logfire`; `logfire.configure()` picks up `LOGFIRE_TOKEN` with no other
-  arguments (pass `service_name=` explicitly per component). No Beam-specific
-  Logfire integration exists, so instrumentation is manual spans/counters in
-  the DoFns and in `tools/compare`'s query functions — this is deliberate:
-  wrapping the Tier 1/2/3 DuckDB queries in spans turns the comparison
-  benchmark into live, queryable traces instead of a one-off `report.py`
-  printout, and results can be pulled back with `logfire query` for
-  `LEARNINGS.md`.
+- **Python (`pipelines/parquet-writer`, `tools/compare`)**:
+  `logfire.configure()` picks up `LOGFIRE_TOKEN` with no other
+  arguments (pass `service_name=` explicitly per component). Beam worker
+  signals use Beam metrics; comparison iterations use bounded Logfire spans.
+  `report.py` writes the complete machine-readable evidence under the
+  gitignored `data/reports/` tree and exports only a compact summary.
 - **Go (`tools/poller`)**: no Logfire-branded Go SDK exists (Logfire's Go
   guidance is "bring your own OpenTelemetry SDK"), so `internal/telemetry`
   uses stock `go.opentelemetry.io/otel` + `otlptracehttp`, pointed at Logfire
   purely via the three `OTEL_EXPORTER_OTLP_*`/`OTEL_SERVICE_NAME` env vars —
   no code-level Logfire dependency at all.
-- **Cross-cutting payoff**: because both sides emit OTLP into the same
-  project, a single trace waterfall can in principle span "poller published →
-  GCS subscription wrote Tier 1/3 → Beam parsed → Parquet flushed" if trace
-  context is propagated via Pub/Sub message attributes (`traceparent`) —
-  called out as a stretch goal, not required for the core comparison, since
-  each tier's spans are independently useful even unlinked.
+- **Cross-cutting payoff**: use `run_id` and `cohort_id` to correlate fan-out
+  stages. Do not fabricate a single parent/child trace across many-to-one batch
+  boundaries; stage traces and durable reconciliation artifacts preserve the
+  actual execution model.
 - **Verification**: after each smoke test (local and cloud), check the
   Logfire live view for the corresponding `service_name` and confirm spans
   landed with the expected `mode`/`sink`/`tier` attributes before moving on.
@@ -381,10 +379,10 @@ One Logfire project, three service names, no separate Collector:
    generic envelope.
 8. Switch Beam pipeline to `DataflowRunner` against the real pull subscription,
    run briefly, cancel the job, confirm Parquet output in GCS.
-9. Run the poller in full loop mode for a bounded period so all three cloud tiers
-   cover the same overlapping batch of records (needed for a fair comparison).
-10. Run `tools/compare`: file size / compression ratio (vs. the original
-    gzipped CloudTrail size as the true baseline), a side-by-side schema dump,
+9. Capture a closed, bounded source cohort in a manifest and require all three
+   tiers to reconcile to its object and event fingerprints. Do not use the
+   current `last_key` loop for this step.
+10. Run `tools/compare`: an explicitly labelled size inventory, a side-by-side schema dump,
     and query benchmarks using DuckDB across S3 and GCS:
     - S3 direct baseline: `SELECT unnest(Records)... FROM read_json('s3://...')`
     - Tier 2: `SELECT ... FROM read_parquet('gs://.../tier2-parquet/*/*.parquet')`

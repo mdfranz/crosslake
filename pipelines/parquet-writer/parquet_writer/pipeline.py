@@ -17,16 +17,16 @@ import logging
 import apache_beam as beam
 from apache_beam.io import ReadFromText, WriteToText
 from apache_beam.io.parquetio import WriteToParquet
+from apache_beam.metrics.metric import MetricsFilter
 from apache_beam.options.pipeline_options import PipelineOptions
-from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 from parquet_writer import telemetry
 from parquet_writer.cloudtrail_schema import CLOUDTRAIL_SCHEMA
-from parquet_writer.transforms import REJECTS_TAG, ParseCloudTrailJson
+from parquet_writer.transforms import METRIC_NAMESPACE, REJECTS_TAG, ParseCloudTrailJson
 
 
 def build_pipeline(
-    p: beam.Pipeline, input_mode: str, input_file: str, output_prefix: str, traceparent: str
+    p: beam.Pipeline, input_mode: str, input_file: str, output_prefix: str
 ) -> None:
     if input_mode != "file":
         raise NotImplementedError(
@@ -36,9 +36,9 @@ def build_pipeline(
 
     lines = p | "ReadRawJsonl" >> ReadFromText(input_file)
 
-    parsed = lines | "ParseCloudTrailJson" >> beam.ParDo(
-        ParseCloudTrailJson(traceparent)
-    ).with_outputs(REJECTS_TAG, main="records")
+    parsed = lines | "ParseCloudTrailJson" >> beam.ParDo(ParseCloudTrailJson()).with_outputs(
+        REJECTS_TAG, main="records"
+    )
 
     _ = (
         parsed.records
@@ -83,20 +83,37 @@ def main():
         runner=known_args.runner,
         input_mode=known_args.input_mode,
     ):
-        # Capture this span as a W3C traceparent *before* the Beam graph
-        # runs: DoFn.process() executes in worker threads/processes where
-        # ambient OTEL context does not cross the boundary, so each
-        # ParseCloudTrailJson call re-attaches this explicitly (see
-        # transforms.py) instead of coming out as an orphaned root trace.
-        carrier: dict[str, str] = {}
-        TraceContextTextMapPropagator().inject(carrier)
-        traceparent = carrier["traceparent"]
-
         options = PipelineOptions(pipeline_args)
-        with beam.Pipeline(options=options) as p:
-            build_pipeline(
-                p, known_args.input_mode, known_args.input_file, known_args.output_prefix, traceparent
+        p = beam.Pipeline(options=options)
+        build_pipeline(p, known_args.input_mode, known_args.input_file, known_args.output_prefix)
+        result = p.run()
+        state = result.wait_until_finish()
+
+        # Export one run summary rather than one remote span per record. Beam
+        # keeps the authoritative worker-side counters; Logfire is the compact
+        # cross-component correlation view.
+        queried = result.metrics().query(MetricsFilter().with_namespace(METRIC_NAMESPACE))
+        counters = {
+            metric.key.metric.name: (
+                metric.committed if metric.committed is not None else metric.attempted
             )
+            for metric in queried["counters"]
+        }
+        distributions = {}
+        for metric in queried["distributions"]:
+            value = metric.committed if metric.committed is not None else metric.attempted
+            if value is None:
+                continue
+            name = metric.key.metric.name
+            distributions.update(
+                {
+                    f"{name}_count": value.count,
+                    f"{name}_min": value.min,
+                    f"{name}_max": value.max,
+                    f"{name}_mean": value.mean,
+                }
+            )
+        logfire.info("beam pipeline completed", state=str(state), **counters, **distributions)
 
     logfire.force_flush()
 

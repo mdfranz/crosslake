@@ -9,7 +9,8 @@ This is the as-built Local Mode diagram.
                               v
    AWS S3 (your CloudTrail bucket, AWSLogs/<acct>/CloudTrail/<region>/...)
                               |
-                              |  ListObjectsV2 + cursor, gunzip, per-record
+                              |  ListObjectsV2 + unsafe last-key cursor,
+                              |  gunzip, per-record transform
                               v
                     tools/poller (Go, --mode=local)
                     /                          \
@@ -42,6 +43,10 @@ This is the as-built Local Mode diagram.
 - **Source is always real S3**, in both this build and the future Cloud
   Mode -- the poller's `s3source` package doesn't change when Cloud Mode is
   added; only the sink does (`internal/pubsubsink` vs `internal/disksink`).
+- **The as-built cursor is not a safe continuous-ingestion design.** CloudTrail
+  can deliver keys out of order, so loop mode requires an explicit unsafe
+  opt-in. The target is a seen-object ledger plus reconciliation; see
+  `review-telemetry-plan.md`.
 - **raw.jsonl and events.avro are siblings, not a pipeline stage into each
   other** -- both are written directly from the same parsed record by the
   poller in one pass, mirroring how Cloud Mode's dual-publish (to

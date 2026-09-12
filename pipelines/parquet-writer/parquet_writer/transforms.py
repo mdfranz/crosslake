@@ -6,21 +6,25 @@ and Tier 3 (Avro) are a fair comparison.
 """
 
 import json
+import time
 from datetime import datetime, timezone
 
 import apache_beam as beam
-import logfire
-from opentelemetry import context as otel_context
-from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from apache_beam.metrics.metric import Metrics
 
 REJECTS_TAG = "rejects"
+METRIC_NAMESPACE = "crosslake.parquet_writer"
 
 
 def _parse_time(s):
     if not s:
         return None
-    # CloudTrail timestamps are RFC3339 with a literal 'Z' suffix.
-    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    # Accept RFC3339 fractional seconds and explicit offsets, not only the
+    # most common whole-second Z form.
+    parsed = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("eventTime must include an RFC3339 timezone")
+    return parsed.astimezone(timezone.utc)
 
 
 def _json_or_none(value):
@@ -34,42 +38,40 @@ class ParseCloudTrailJson(beam.DoFn):
     REJECTS_TAG side output as (raw_line, error) pairs instead of a full
     DLQ -- see PLAN.md ("Tier 2 Beam pipeline").
 
-    traceparent is a W3C traceparent string captured from the pipeline-run
-    span *before* the Beam graph is built. Beam's DirectRunner (and any
-    other runner) executes DoFn.process() in worker threads/processes where
-    Python's ambient OTEL context does not cross the boundary -- without
-    explicitly re-attaching this parent context in each process() call,
-    every parse_record span comes out as its own orphaned root trace
-    instead of a child of run_pipeline.
+    Per-element signals use Beam's runner-native metrics. A Logfire span per
+    record is both expensive and misleading in a distributed runner: all
+    records were previously attached to one driver-created trace context.
     """
 
-    def __init__(self, traceparent: str):
-        self._traceparent = traceparent
+    def __init__(self):
+        self._parsed = Metrics.counter(METRIC_NAMESPACE, "parsed_records")
+        self._rejected_json = Metrics.counter(METRIC_NAMESPACE, "rejected_invalid_json")
+        self._rejected_parse = Metrics.counter(METRIC_NAMESPACE, "rejected_parse_error")
+        self._input_bytes = Metrics.distribution(METRIC_NAMESPACE, "input_record_bytes")
+        self._parse_us = Metrics.distribution(METRIC_NAMESPACE, "parse_duration_us")
 
     def process(self, element: str):
-        token = otel_context.attach(
-            TraceContextTextMapPropagator().extract({"traceparent": self._traceparent})
-        )
+        started_ns = time.perf_counter_ns()
+        self._input_bytes.update(len(element.encode("utf-8")))
         try:
-            with logfire.span("parse_record"):
-                try:
-                    raw = json.loads(element)
-                except json.JSONDecodeError as e:
-                    logfire.metric_counter("parquet_writer.rejected_records").add(1)
-                    yield beam.pvalue.TaggedOutput(REJECTS_TAG, (element, f"invalid JSON: {e}"))
-                    return
+            raw = json.loads(element)
+        except json.JSONDecodeError as e:
+            self._rejected_json.inc()
+            self._parse_us.update((time.perf_counter_ns() - started_ns) // 1_000)
+            yield beam.pvalue.TaggedOutput(REJECTS_TAG, (element, f"invalid JSON: {e}"))
+            return
 
-                try:
-                    record = self._to_record(raw)
-                except Exception as e:  # noqa: BLE001 -- one bad record shouldn't kill the pipeline
-                    logfire.metric_counter("parquet_writer.rejected_records").add(1)
-                    yield beam.pvalue.TaggedOutput(REJECTS_TAG, (element, f"parse error: {e}"))
-                    return
+        try:
+            record = self._to_record(raw)
+        except Exception as e:  # noqa: BLE001 -- one bad record shouldn't kill the pipeline
+            self._rejected_parse.inc()
+            self._parse_us.update((time.perf_counter_ns() - started_ns) // 1_000)
+            yield beam.pvalue.TaggedOutput(REJECTS_TAG, (element, f"parse error: {e}"))
+            return
 
-                logfire.metric_counter("parquet_writer.parsed_records").add(1)
-                yield record
-        finally:
-            otel_context.detach(token)
+        self._parsed.inc()
+        self._parse_us.update((time.perf_counter_ns() - started_ns) // 1_000)
+        yield record
 
     @staticmethod
     def _to_record(raw: dict) -> dict:

@@ -1,6 +1,6 @@
 # Observability: Logfire (Python) + OpenTelemetry (Go)
 
-One Logfire project (`endpoint-plus-plus`), three service names, no
+One Logfire project (`<your-project>`), three service names, no
 separate Collector. See PLAN.md ("Observability (Logfire + OpenTelemetry)")
 for the original design; this doc is the as-built version.
 
@@ -8,7 +8,7 @@ for the original design; this doc is the as-built version.
 
 ```sh
 uvx logfire --region=us auth
-uvx logfire --region=us projects use --org <your-org> endpoint-plus-plus
+uvx logfire --region=us projects use --org <your-org> <your-project>
 ```
 
 This writes `.logfire/logfire_credentials.json` at the repo root (gitignored
@@ -51,23 +51,32 @@ Service names: `crosslake-poller`, `crosslake-parquet-writer`,
 - **Short-lived `--once` Go runs drop their last spans** if the process
   exits before `tracerProvider.Shutdown(ctx)` flushes the batch exporter --
   `cmd/poller/main.go` defers this with a fresh (non-cancelled) context.
-- **Beam breaks span parenting across the DoFn worker-thread boundary.**
-  `DoFn.process()` runs in worker threads/processes where Python's ambient
-  OTEL context (contextvars) does not propagate from the span opened in
-  `main()`. Without an explicit fix, every `parse_record` span comes out as
-  its own orphaned root trace (`parent_span_id: null`) instead of nesting
-  under `run_pipeline` -- confirmed via a live Logfire query during
-  development. Fix: capture a W3C `traceparent` string from the
-  `run_pipeline` span *before* building the Beam graph, pass it into
-  `ParseCloudTrailJson(traceparent)`, and re-attach it
-  (`opentelemetry.context.attach(...)`) at the top of every `process()`
-  call. See `parquet_writer/transforms.py` and `parquet_writer/pipeline.py`.
+- **A driver trace is not a parent for every Beam element.** `DoFn.process()`
+  runs in worker threads/processes where the driver's ambient OTEL context does
+  not propagate. An earlier workaround re-attached one captured `traceparent`
+  to every record, producing high-volume spans and implying that distributed
+  worker work was one local call tree. Element-level accepted/rejected counts,
+  input-size distribution, and parse-duration distribution now use Beam
+  metrics. Logfire gets one driver run span and a compact counter summary.
 - **Cross-service trace stitching (poller -> Beam) is intentionally not
   done.** The interchange between them is a file (`data/raw.jsonl`), not a
   traced RPC, and one Beam run reads the cumulative output of many
   independent poller runs -- there's no single causal parent trace to
   attach to (many-to-one, not one-to-one). A shared correlation attribute
   (e.g. a `batch_id`) would get most of the practical value without
-  fabricating a causality link that isn't real; full `traceparent`
-  propagation across that boundary stays the stretch goal PLAN.md already
-  called out.
+  fabricating a causality link that isn't real. Use a `run_id`/`cohort_id`
+  correlation field plus durable reconciliation artifacts instead of forcing a
+  single trace across batch and fan-out boundaries.
+
+## Data minimization and cardinality
+
+Telemetry is not a second copy of CloudTrail. Do not export bucket names,
+object keys, account IDs, ARNs, source IPs, user agents, request/response
+payloads, or raw exception strings. Use stable error categories and keep
+sensitive diagnostics in local logs. Keep metric dimensions bounded; run and
+cohort IDs are useful correlation fields on summaries, not metric labels.
+
+The authoritative experiment record is a gitignored run manifest containing
+cohort fingerprints, stage counts, versions, and benchmark parameters. Traces
+and metrics are a searchable projection. The rationale and target signal model
+are in [`review-telemetry-plan.md`](review-telemetry-plan.md).

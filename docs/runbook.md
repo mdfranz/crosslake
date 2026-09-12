@@ -23,7 +23,13 @@ make poll-once
 Confirms: S3 `ListObjectsV2` + gunzip works, `./data/raw.jsonl` grows,
 `./data/tier3-avro/events.avro` grows (appends across runs -- see
 `LEARNINGS.md` bug #1), cursor advances (`tools/poller/cursor.json`,
-gitignored). Re-running with no new S3 objects should report `0 record(s)`.
+gitignored). Restrict this command to a closed, day-scoped prefix. Continuous
+or repeated polling with the current `last_key` cursor can miss late CloudTrail
+deliveries; see `docs/review-telemetry-plan.md`.
+
+Loop mode is blocked by default. `make poll-loop` explicitly acknowledges the
+known unsafe cursor and exists only for controlled experiments; do not use it
+for completeness-sensitive ingestion.
 
 Sanity-check Tier 3 directly:
 
@@ -50,19 +56,20 @@ Confirms: `./data/tier2-parquet/events-*.parquet` is written, rejects file
 ## 3. Compare
 
 ```sh
-make compare-sizes    # file sizes vs. the original gzipped S3 JSON
+make compare-sizes    # unreconciled remote/local size inventory
 make compare-schema   # side-by-side Tier 2 vs Tier 3 column types
-make compare-bench    # identical SQL timed across S3 JSON / Parquet / Avro
-make compare-encode   # same-process Avro (fastavro) vs Parquet (pyarrow) encode time
-make compare-report   # all of the above, rendered as Markdown for LEARNINGS.md
+make compare-bench    # warmups + 5 randomized trials; validates result hashes
+make compare-encode   # repeated/randomized same-process encode benchmark
+make compare-report   # Markdown + gitignored JSON evidence under data/reports/
 ```
 
 ## 4. Confirm telemetry
 
-Each of the above should show up in Logfire under its service name:
+Each component run should show up in Logfire under its service name:
 `crosslake-poller`, `crosslake-parquet-writer`, `crosslake-compare`. See
-`docs/observability.md` for the query used to verify span parenting works
-correctly (a real bug was caught and fixed this way -- see `LEARNINGS.md`).
+`docs/observability.md`. Beam element counts and duration distributions are
+runner-native metrics; Logfire intentionally receives only a run span and
+summary rather than one span per CloudTrail record.
 
 ## Resetting to a clean run
 

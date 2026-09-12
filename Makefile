@@ -14,7 +14,7 @@ poll-once:
 poll-loop:
 	cd tools/poller && \
 	. ../../scripts/logfire-env.sh && \
-	go run ./cmd/poller --mode=local
+	go run ./cmd/poller --mode=local --allow-unsafe-last-key-polling
 
 beam-local:
 	cd pipelines/parquet-writer && \

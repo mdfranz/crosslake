@@ -7,13 +7,15 @@ through a real pipeline: AWS S3 -> (GCP Pub/Sub ->) GCS/local disk. See
 **Current scope: Local Mode only.** No GCP infrastructure is provisioned or
 required. The Go poller reads real CloudTrail logs from S3 and writes to
 local disk; the Beam pipeline runs on `DirectRunner`; the compare tool uses
-DuckDB against local files (and S3 directly, as the size/speed baseline).
+DuckDB against local files and S3 directly. Remote S3 versus compacted local
+files is a storage-layout observation, not an isolated format benchmark; see
+the [architecture and telemetry review](docs/review-telemetry-plan.md).
 Cloud Mode (GCP Pub/Sub + Dataflow, the full 3-tier design in `PLAN.md`) is
 designed but not built yet.
 
 ## Quickstart
 
-Prerequisites: Go 1.23+, [uv](https://docs.astral.sh/uv/) (pins Python 3.14
+Prerequisites: Go 1.26.1+, [uv](https://docs.astral.sh/uv/) (pins Python 3.14
 itself, nothing to install separately), AWS credentials with read access to
 a CloudTrail S3 bucket.
 
@@ -26,12 +28,15 @@ uvx logfire --region=us projects use --org <your-org> <your-project>
 cp tools/poller/config.example.yaml tools/poller/config.yaml
 $EDITOR tools/poller/config.yaml
 
-make poll-once       # pulls real CloudTrail records into ./data/
+make poll-once        # use a closed day prefix; see the cursor warning below
 make beam-local       # ./data/raw.jsonl -> ./data/tier2-parquet/ (Parquet)
-make compare-report   # sizes + schema diff + query & encode benchmarks
+make compare-report   # Markdown + JSON evidence under ./data/reports/
 ```
 
 `./data/` is gitignored; nothing it contains is ever committed.
+The current last-key cursor is unsafe for continuous CloudTrail delivery, so
+loop mode requires an explicit opt-in. It is retained only for controlled
+experiments while a seen-object ledger is designed.
 
 ## Layout
 

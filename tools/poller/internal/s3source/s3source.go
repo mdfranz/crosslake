@@ -26,8 +26,10 @@ func New(client *s3.Client, bucket, prefix string) *Source {
 }
 
 // ListSince returns object keys under the configured prefix that sort after
-// startAfter (empty lists from the beginning), in ascending order -- which,
-// for CloudTrail's key layout, is also chronological order.
+// startAfter (empty lists from the beginning), in ascending lexicographic
+// order. This is not a safe incremental CloudTrail inventory: delivery can be
+// out of order. Callers must restrict it to closed prefixes until a seen-object
+// ledger and reconciliation replace the last-key cursor.
 func (s *Source) ListSince(ctx context.Context, startAfter string) ([]string, error) {
 	var keys []string
 	var token *string

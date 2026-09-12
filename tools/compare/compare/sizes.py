@@ -1,8 +1,8 @@
-"""File size / compression comparison across the S3 baseline and the two
-local tiers -- see PLAN.md ("Build / verification order", step 10).
+"""Size inventory across the current S3 prefix and cumulative local tiers.
 
-The true baseline is the original gzipped CloudTrail JSON size in S3, not
-the local raw.jsonl (which is uncompressed, for the Beam pipeline to read).
+These values are not a format comparison until an experiment manifest proves
+the remote and local cohorts match and accounts for fields omitted by the typed
+schema. See docs/review-telemetry-plan.md.
 """
 
 from pathlib import Path
