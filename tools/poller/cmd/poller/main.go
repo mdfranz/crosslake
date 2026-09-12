@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func main() {
@@ -37,6 +39,7 @@ func main() {
 	once := flag.Bool("once", false, "run a single poll pass and exit")
 	s3Prefix := flag.String("s3-prefix", "", "S3 prefix override (default: from config) -- for backfilling an earlier date range without touching the live cursor")
 	cursorFile := flag.String("cursor-file", "", "cursor file override (default: from config) -- pair with -s3-prefix so a backfill run doesn't reuse (or clobber) the live tailing cursor")
+	fetchConcurrency := flag.Int("fetch-concurrency", 0, "concurrent S3 fetch override (default: from config, normally 16) -- set 1 to restore fully-sequential fetching")
 	allowUnsafePolling := flag.Bool(
 		"allow-unsafe-last-key-polling",
 		false,
@@ -76,6 +79,9 @@ func main() {
 	}
 	if err := applySourceOverrides(&cfg, *s3Prefix, *cursorFile); err != nil {
 		log.Fatal(err)
+	}
+	if *fetchConcurrency > 0 {
+		cfg.FetchConcurrency = *fetchConcurrency
 	}
 	if !*once && !*allowUnsafePolling {
 		log.Fatal(
@@ -176,48 +182,67 @@ func runOnce(ctx context.Context, src *s3source.Source, schema avro.Schema, cfg 
 		}
 	}()
 
+	// Chunk by CheckpointEveryObjects: within each chunk, fetch+gunzip runs
+	// concurrently (bounded by FetchConcurrency) since it's I/O-bound and
+	// dominates wall-clock time by ~1000x over local parse+write (see
+	// LEARNINGS.md); parsing and writing that chunk's results then runs
+	// strictly sequentially, in listing order, before the chunk's single
+	// flush+checkpoint -- disksink.Sink isn't safe for concurrent writes,
+	// and the cursor's meaning depends on listing order regardless of
+	// which fetch happened to finish first over the network.
 	total := 0
-	for objectIndex, key := range keys {
-		objCtx, objSpan := tracer.Start(ctx, "process_object")
-		objSpan.SetAttributes(attribute.Int("object.index", objectIndex))
-		objectStarted := time.Now()
-		body, err := src.FetchAndGunzip(objCtx, key)
-		if err != nil {
-			objSpan.SetStatus(codes.Error, "fetch_failed")
-			objSpan.End()
-			return total, err
+	for chunkStart := 0; chunkStart < len(keys); chunkStart += cfg.CheckpointEveryObjects {
+		chunkEnd := chunkStart + cfg.CheckpointEveryObjects
+		if chunkEnd > len(keys) {
+			chunkEnd = len(keys)
 		}
-		objSpan.SetAttributes(attribute.Int("object.uncompressed_bytes", len(body)))
+		chunk := keys[chunkStart:chunkEnd]
 
-		var blob struct {
-			Records []json.RawMessage `json:"Records"`
-		}
-		if err := json.Unmarshal(body, &blob); err != nil {
-			objSpan.SetStatus(codes.Error, "decode_failed")
-			objSpan.End()
-			return total, fmt.Errorf("unmarshal %s: %w", key, err)
-		}
-
-		for _, raw := range blob.Records {
-			rec, err := avroenc.FromJSON(raw)
+		bodies, fetchErrs := fetchChunkConcurrently(ctx, src, tracer, chunk, chunkStart, cfg.FetchConcurrency)
+		for i, err := range fetchErrs {
 			if err != nil {
-				objSpan.SetStatus(codes.Error, "record_parse_failed")
-				objSpan.End()
-				return total, fmt.Errorf("parsing record from %s: %w", key, err)
+				return total, fmt.Errorf("fetching object %d (%s): %w", chunkStart+i, chunk[i], err)
 			}
-			if err := sink.WriteRecord(raw, rec); err != nil {
-				objSpan.SetStatus(codes.Error, "record_write_failed")
-				objSpan.End()
-				return total, err
-			}
-			total++
 		}
 
-		objSpan.SetAttributes(
-			attribute.Int("object.records_written", len(blob.Records)),
-			attribute.Int64("object.duration_ms", time.Since(objectStarted).Milliseconds()),
-		)
-		objSpan.End()
+		var lastKeyInChunk string
+		for i, key := range chunk {
+			objectIndex := chunkStart + i
+			_, objSpan := tracer.Start(ctx, "process_object")
+			objSpan.SetAttributes(attribute.Int("object.index", objectIndex))
+			objectStarted := time.Now()
+
+			var blob struct {
+				Records []json.RawMessage `json:"Records"`
+			}
+			if err := json.Unmarshal(bodies[i], &blob); err != nil {
+				objSpan.SetStatus(codes.Error, "decode_failed")
+				objSpan.End()
+				return total, fmt.Errorf("unmarshal %s: %w", key, err)
+			}
+
+			for _, raw := range blob.Records {
+				rec, err := avroenc.FromJSON(raw)
+				if err != nil {
+					objSpan.SetStatus(codes.Error, "record_parse_failed")
+					objSpan.End()
+					return total, fmt.Errorf("parsing record from %s: %w", key, err)
+				}
+				if err := sink.WriteRecord(raw, rec); err != nil {
+					objSpan.SetStatus(codes.Error, "record_write_failed")
+					objSpan.End()
+					return total, err
+				}
+				total++
+			}
+
+			objSpan.SetAttributes(
+				attribute.Int("object.records_written", len(blob.Records)),
+				attribute.Int64("object.duration_ms", time.Since(objectStarted).Milliseconds()),
+			)
+			objSpan.End()
+			lastKeyInChunk = key
+		}
 
 		// OCF writes are buffered, and Flush forces a new compression
 		// block. Flushing/checkpointing after every single object was
@@ -230,19 +255,52 @@ func runOnce(ctx context.Context, src *s3source.Source, schema avro.Schema, cfg 
 		// next run re-fetches and re-appends that batch's objects -- the
 		// same at-least-once/idempotent-replay model as before, just over
 		// a larger, tunable window instead of a hidden per-object one.
-		isLastObject := objectIndex == len(keys)-1
-		unflushedObjects := (objectIndex % cfg.CheckpointEveryObjects) + 1
-		if unflushedObjects >= cfg.CheckpointEveryObjects || isLastObject {
-			if err := sink.Flush(); err != nil {
-				return total, fmt.Errorf("flush after object %d (%s): %w", objectIndex, key, err)
-			}
-			cur.LastKey = key
-			if err := cursor.Save(cfg.CursorFile, cur); err != nil {
-				return total, fmt.Errorf("checkpoint after object %d (%s): %w", objectIndex, key, err)
-			}
+		if err := sink.Flush(); err != nil {
+			return total, fmt.Errorf("flush after chunk ending %s: %w", lastKeyInChunk, err)
+		}
+		cur.LastKey = lastKeyInChunk
+		if err := cursor.Save(cfg.CursorFile, cur); err != nil {
+			return total, fmt.Errorf("checkpoint after chunk ending %s: %w", lastKeyInChunk, err)
 		}
 	}
 
 	span.SetAttributes(attribute.Int("records.written", total))
 	return total, nil
+}
+
+// fetchChunkConcurrently fetches and gunzips a chunk of S3 objects with up
+// to concurrency requests in flight at once. Results are returned in the
+// same order as keys (bodies[i] / errs[i] correspond to keys[i]) regardless
+// of completion order, since the caller must process and checkpoint them in
+// listing order.
+func fetchChunkConcurrently(
+	ctx context.Context, src *s3source.Source, tracer trace.Tracer, keys []string, startIndex, concurrency int,
+) (bodies [][]byte, errs []error) {
+	bodies = make([][]byte, len(keys))
+	errs = make([]error, len(keys))
+
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for i, key := range keys {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, key string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			objCtx, objSpan := tracer.Start(ctx, "fetch_object")
+			objSpan.SetAttributes(attribute.Int("object.index", startIndex+i))
+			body, err := src.FetchAndGunzip(objCtx, key)
+			if err != nil {
+				objSpan.SetStatus(codes.Error, "fetch_failed")
+				errs[i] = err
+			} else {
+				objSpan.SetAttributes(attribute.Int("object.uncompressed_bytes", len(body)))
+				bodies[i] = body
+			}
+			objSpan.End()
+		}(i, key)
+	}
+	wg.Wait()
+	return bodies, errs
 }

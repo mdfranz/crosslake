@@ -24,3 +24,11 @@ poll_interval_seconds: 60
 # better but widen the at-least-once replay window on crash (up to this many
 # objects re-fetched and re-appended next run). Default: 100.
 checkpoint_every_objects: 100
+
+# How many S3 GetObject+gunzip fetches run concurrently within each
+# checkpoint batch. Fetch latency is network-RTT-bound, not CPU-bound, and
+# dominates poll wall-clock time by ~1000x over local parse+write (see
+# LEARNINGS.md) -- measured ~8x real speedup (87.9ms/object -> 11.0ms/object
+# average) at the default vs. sequential (1). Parsing/writing always stays
+# strictly sequential regardless of this value. Default: 16.
+fetch_concurrency: 16

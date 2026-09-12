@@ -204,22 +204,30 @@ concrete optimization targets, not hypothetical ones.
     in this review. If auth here ever moves off static env-var credentials,
     broaden to `CHAIN 'env;config;sts;sso'` -- still excluding `instance`.
 
-13. **The Go poller fetches S3 objects strictly sequentially** (a plain
+13. **The Go poller fetched S3 objects strictly sequentially** (a plain
     `for objectIndex, key := range keys { FetchAndGunzip(...) }` loop, no
-    concurrency at all). Telemetry confirms this is the dominant remaining
-    cost on any real poll: `fetch_object`/`process_object` spans average
-    72-88ms each (network RTT-bound, not CPU-bound -- `write_record`'s own
-    per-record cost is ~64 microseconds, 1000x smaller), and a poll
+    concurrency at all). Telemetry confirmed this was the dominant
+    remaining cost on any real poll: `fetch_object`/`process_object` spans
+    averaged 72-88ms each (network RTT-bound, not CPU-bound -- `write_record`'s
+    own per-record cost is ~64 microseconds, 1000x smaller), and a poll
     against ~1,000+ objects took up to 141s wall-clock, purely from that
-    latency multiplying sequentially. S3 comfortably supports concurrent
-    `GetObject` calls; a bounded worker pool (e.g. 16-32 concurrent
-    fetches) would plausibly cut wall-clock poll time by an order of
-    magnitude for large/bursty batches. **Not implemented** -- this changes
-    core fetch-loop behavior (ordering guarantees for cursor advancement,
-    error handling under partial-batch failure) enough that it deserves a
-    deliberate decision, not a drive-by change during an optimization
-    pass. Flagged as the clear next target if poll latency matters more
-    than it currently does for this learning prototype's scale.
+    latency multiplying sequentially. **Fixed**: fetching is now chunked by
+    `checkpoint_every_objects` and each chunk's objects are fetched
+    concurrently (`fetchChunkConcurrently` in `cmd/poller/main.go`), bounded
+    by a new `fetch_concurrency` config (default 16, CLI override
+    `--fetch-concurrency`, set to 1 to restore the original sequential
+    behavior). Parsing and writing stay strictly sequential in listing
+    order after each chunk's fetches complete -- `disksink.Sink` isn't safe
+    for concurrent writes, and the cursor checkpoint's meaning depends on
+    listing order regardless of which fetch finished first over the
+    network. Verified with a real side-by-side run against two comparable
+    prior days: **956 objects in 84.1s sequential vs. 781 objects in 8.55s
+    concurrent** -- normalized, 87.9ms/object -> 11.0ms/object, a measured
+    ~8x speedup. Checked with `go test -race` (both the unit tests and a
+    real end-to-end run against live S3 with a `-race`-instrumented
+    binary) -- no races. `raw.jsonl` and the Avro file stayed in exact
+    row-count agreement (5,630 both) after the concurrent runs, confirming
+    no ordering corruption or lost writes.
 
 14. Looked for but did not find a real optimization case in Go's
     `canonicalJSONPtr` (allocates a new `bytes.Buffer` + `json.Encoder` per
